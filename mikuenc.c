@@ -86,7 +86,14 @@
 //     constant) decoded back as an entirely blank image, RGB deltas
 //     silently discarded. Forcing exact=1 specifically for delta-buffer
 //     tasks (see above) fixes this without changing the user's own -exact
-//     setting for keyframes.
+//     setting for keyframes -- when delta_frames is off, where nothing
+//     ever reconstructs against a keyframe's ref_frame cross-frame, so
+//     there's nothing for exact=0's RGB-under-transparency freedom to
+//     corrupt. When delta_frames is on, the same keyframe *is* referenced
+//     that way (it seeds the block's delta chain), so miku_worker forces
+//     exact=1 there too -- same underlying reason, just one hop removed
+//     from the delta buffers themselves. See -exact's own option
+//     description for the user-facing summary.
 //
 //   - HDR/color metadata needs no special-case code here at all: it's
 //     handled generically by libavcodec/encode.c (color_primaries/trc/
@@ -112,6 +119,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/internal.h"
+#include "libavutil/cpu.h"
 #include "libavutil/thread.h"
 #include "pthread_internal.h"
 
@@ -277,8 +285,23 @@ static void *miku_worker(void *arg)
         // can't be a mutate-then-restore on the shared s->config anymore
         // now that multiple workers can be inside WebPEncode at once.
         local_config = s->config;
-        if (task->is_keyframe == 0) {
+
+        // Keyframes need exact=1 too, but only once delta_frames is on:
+        // this keyframe becomes the ref_frame a delta chain reconstructs
+        // against, and if exact=0 lets WebP pick different RGB under
+        // alpha=0 here, the encoder's true ref_frame and the decoder's
+        // reconstructed one silently diverge at every pixel that was
+        // transparent on this keyframe. Invisible right up until (if
+        // ever) alpha moves off zero there later in the chain, at which
+        // point it surfaces as real, visible corruption -- see the reply.
+        // Harmless, and correctly left alone, when delta_frames is off:
+        // nothing ever references this keyframe's ref_frame cross-frame
+        // in that mode, so -exact keeps meaning exactly what its own
+        // description says.
+        if (task->is_keyframe == 0 || s->delta_frames)
             local_config.exact = 1;
+
+        if (task->is_keyframe == 0) {
             // Independent of exact: retrieval in miku_encode_frame is
             // strict submission order, so one task stuck in a slow
             // WebPEncode call blocks every later packet no matter how
@@ -376,13 +399,52 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
             s->ref_frame_size = s->delta_buf_size = needed;
         }
 
-        // avctx->thread_count is already resolved to a real, positive
-        // value by this point (confirmed empirically: ff_thread_init runs
-        // before this encoder's own init() callback, regardless of
-        // whether AV_CODEC_CAP_FRAME_THREADS is declared -- that capability
-        // only affects whether the *generic round-robin* framework wraps
-        // this encoder, not whether thread_count itself gets resolved).
-        s->nthreads = avctx->thread_count > 0 ? avctx->thread_count : 1;
+        // avctx->thread_count is 0 here on a completely ordinary run: the
+        // ffmpeg CLI explicitly sets "auto" (fftools/ffmpeg_enc.c) unless
+        // the user passes -threads themselves, and libavcodec's own
+        // AVOption default for thread_count is 1 (options_table.h), not 0
+        // -- neither of those is a real core count. Resolving that 0 used
+        // to be this encoder's actual bug, not just a missing nicety:
+        // ff_thread_init() (libavcodec/pthread.c, validate_thread_parameters)
+        // force-clamps thread_count to exactly 1 for any codec that
+        // declares none of AV_CODEC_CAP_FRAME_THREADS, _SLICE_THREADS, or
+        // the internal FF_CODEC_CAP_AUTO_THREADS -- confirmed directly
+        // against that function's current source. We deliberately don't
+        // want the first two (see the capabilities comment below), so
+        // without the third this encoder silently got exactly one worker
+        // thread on every run regardless of how many cores were actually
+        // available -- and, because the clamp fires unconditionally in
+        // that branch, regardless of an explicit -threads N too.
+        // FF_CODEC_CAP_AUTO_THREADS (below) stops that clamp, but it also
+        // hands *us* the job that ff_frame_thread_init would otherwise
+        // have done for a generically-threaded codec: turning thread_count
+        // == 0 into a real number.
+        //
+        // Deliberately NOT mirroring ff_frame_thread_init's own "+1" here,
+        // on reflection -- that extra thread earns its keep for a decode
+        // pipeline with real I/O- and sync-adjacent stalls to fill; there's
+        // no equivalent idle time to fill in a pool that does nothing but
+        // call WebPEncode back to back. VP8L's compression search is
+        // compute- *and* cache-heavy (large backward-reference hash
+        // tables, real memory-bandwidth pressure), so on a CPU whose
+        // logical thread count outruns its physical core count and shared
+        // cache size -- a 4C/8T part, say -- one worker beyond nb_cpus
+        // buys nothing and can cost real throughput once the concurrent
+        // working set stops fitting the cache: more reported CPU usage
+        // from cores churning on contention, less actual progress. Plain
+        // nb_cpus, still capped at MAX_AUTO_THREADS, is the more
+        // defensible default; -threads remains how to tune it further for
+        // a specific machine and content, in either direction -- fewer
+        // threads can genuinely outrun more once the cache is the limit,
+        // not the core count.
+        if (avctx->thread_count > 0) {
+            s->nthreads = avctx->thread_count;
+        } else {
+            int nb_cpus = av_cpu_count();
+            s->nthreads = nb_cpus > 0 ? nb_cpus : 1;
+            if (s->nthreads > MAX_AUTO_THREADS)
+                s->nthreads = MAX_AUTO_THREADS;
+        }
         s->ntasks   = s->nthreads + MIKU_TASK_SLACK;
 
         s->tasks = av_calloc(s->ntasks, sizeof(*s->tasks));
@@ -618,7 +680,11 @@ static const AVOption miku_options[] = {
       "this option at 6, as it used to be, silently made the best compression libwebp "
       "offers unreachable. libwebp's own default recommendation is level 6.",
       OFFSET(method), AV_OPT_TYPE_INT, { .i64 = 6 }, 0, 9, VE },
-    { "exact", "Preserve exact RGB values under fully transparent alpha",
+    { "exact", "Preserve exact RGB values under fully transparent alpha, for keyframes. "
+      "Always on regardless of this setting for delta residuals, and for keyframes too "
+      "once -delta_frames is on (the default) -- see miku_worker's own comment for why a "
+      "keyframe that seeds a delta chain needs this the same way the deltas themselves "
+      "do. Only actually controls anything when -delta_frames 0 is set explicitly.",
       OFFSET(exact), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "thread_level", "Let libwebp try its own internal threading for one frame's encode "
       "(separate from -threads, which parallelizes across frames)",
@@ -655,7 +721,8 @@ const FFCodec ff_miku_encoder = {
     CODEC_LONG_NAME("Fast frame-parallel lossless WebP (VP8L) encoder for .miku"),
     .p.type         = AVMEDIA_TYPE_VIDEO,
     .p.id           = AV_CODEC_ID_WEBP,
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_OTHER_THREADS,
     // AV_CODEC_CAP_DELAY: required now that this encoder genuinely buffers
     // output across the worker pool (a frame submitted now may not have its
     // packet retrievable until a later call, by design -- see the
@@ -681,6 +748,28 @@ const FFCodec ff_miku_encoder = {
     // same time this encoder is already parallelizing internally --
     // needless oversubscription at best, and for delta_frames=1 the exact
     // round-robin hazard already established as unsafe.
+    //
+    // AV_CODEC_CAP_OTHER_THREADS above, by contrast, is exactly what we
+    // do want: the public "this codec threads itself, through neither
+    // generic mechanism" declaration -- the same one every external-
+    // library-wrapping encoder in this tree pairs with
+    // FF_CODEC_CAP_AUTO_THREADS below (libx264.c, libx265.c, libvpxenc.c,
+    // libaomenc.c, librav1e.c, libsvtav1.c, ...; verified against a real
+    // checkout, not assumed). On its own it doesn't change
+    // ff_thread_init()'s behavior, though -- see .caps_internal.
+    .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
+    // The flag that actually matters for thread_count. validate_thread_
+    // parameters() (libavcodec/pthread.c) force-clamps thread_count to 1
+    // for any codec lacking AV_CODEC_CAP_FRAME_THREADS, _SLICE_THREADS,
+    // *and* this internal flag -- confirmed directly against that
+    // function's source. Without it, this encoder always got exactly one
+    // worker thread, on every run, regardless of -threads or core count:
+    // the actual cause of a real, reported "encoder only ever uses one
+    // core" bug. Declaring it tells the generic pipeline this codec -- not
+    // it -- is responsible for interpreting thread_count == 0 ("auto"),
+    // which is why miku_encode_init now resolves that 0 itself (see its
+    // own comment) rather than leaving it to a generic frame/slice-thread
+    // init that never runs for a codec declaring neither.
     CODEC_PIXFMTS(AV_PIX_FMT_BGRA),
     .p.priv_class   = &miku_encoder_class,
     .p.wrapper_name = "miku",

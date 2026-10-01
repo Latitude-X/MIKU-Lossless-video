@@ -65,6 +65,7 @@
 #include "libavutil/dict.h"
 #include "libavutil/mem.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/opt.h"
 
 #define MIKU_FORMAT_VERSION    1
 #define MIKU_HEADER_SIZE       64
@@ -107,9 +108,12 @@ typedef struct MikuIndexEntry {
 } MikuIndexEntry;
 
 typedef struct MikuMuxContext {
+    const AVClass *class; // must be first: required by the AVOptions machinery
     int video_stream_idx;   // -1 until resolved in init()
     int audio_stream_idx;
     int thumb_stream_idx;   // -1 if no attached-pic stream was provided
+
+    int auto_thumbnail; // -auto_thumbnail option; see miku_write_packet
 
     // Resolved once in init() from the video stream's codec_id: 1 iff it's
     // AV_CODEC_ID_MIKU_DELTA (the encoder only ever emits that id when its
@@ -205,12 +209,37 @@ static void miku_write_json_string(AVIOContext *pb, const char *s)
     avio_w8(pb, '"');
 }
 
-// Serializes s->metadata (the standard AVDictionary every muxer already
-// exposes -- item 7: this is the "metadata dict" route, chosen over a custom
-// AVOptions/private-class scheme because callers already know how to set
-// this via "-metadata key=value" with zero format-specific code on their end)
-// into a minimal flat JSON object. Returns a buffer the caller must av_free().
-static int miku_build_metadata_json(AVFormatContext *s, uint8_t **out_buf, int *out_size)
+// Writes dict as a flat JSON object {"key":"value",...}. Shared by the
+// format-level metadata, each stream's metadata, and each chapter's
+// metadata below -- all exactly this same shape.
+static void miku_write_dict_json(AVIOContext *dyn, const AVDictionary *dict)
+{
+    const AVDictionaryEntry *e = NULL;
+    int first = 1;
+    avio_w8(dyn, '{');
+    while ((e = av_dict_iterate(dict, e))) {
+        if (!first)
+            avio_w8(dyn, ',');
+        first = 0;
+        miku_write_json_string(dyn, e->key);
+        avio_w8(dyn, ':');
+        miku_write_json_string(dyn, e->value);
+    }
+    avio_w8(dyn, '}');
+}
+
+// Serializes s->metadata, per-stream metadata, and chapters into one JSON
+// object. Top-level keys are s->metadata verbatim, unchanged from before --
+// item 7's original "-metadata key=value" route, so existing readers of the
+// old flat shape see no difference. Stream metadata and chapters are new,
+// namespaced under __miku_streams/__miku_chapters so they can't collide
+// with a real metadata key (a caller would have to go out of their way with
+// "-metadata __miku_chapters=...") and so a reader that only understands
+// the old flat shape just sees two extra, ignorable top-level keys rather
+// than anything that could misparse. Returns a buffer the caller must
+// av_free().
+static int miku_build_metadata_json(AVFormatContext *s, AVStream *vst, AVStream *ast,
+                                     uint8_t **out_buf, int *out_size)
 {
     AVIOContext *dyn;
     const AVDictionaryEntry *e = NULL;
@@ -228,6 +257,55 @@ static int miku_build_metadata_json(AVFormatContext *s, uint8_t **out_buf, int *
         avio_w8(dyn, ':');
         miku_write_json_string(dyn, e->value);
     }
+
+    if (!first)
+        avio_w8(dyn, ',');
+    miku_write_json_string(dyn, "__miku_streams");
+    avio_w8(dyn, ':');
+    avio_w8(dyn, '{');
+    miku_write_json_string(dyn, "video");
+    avio_w8(dyn, ':');
+    miku_write_dict_json(dyn, vst->metadata);
+    avio_w8(dyn, ',');
+    miku_write_json_string(dyn, "audio");
+    avio_w8(dyn, ':');
+    miku_write_dict_json(dyn, ast->metadata);
+    avio_w8(dyn, '}');
+
+    if (s->nb_chapters > 0) {
+        avio_w8(dyn, ',');
+        miku_write_json_string(dyn, "__miku_chapters");
+        avio_w8(dyn, ':');
+        avio_w8(dyn, '[');
+        for (int i = 0; i < s->nb_chapters; i++) {
+            AVChapter *ch = s->chapters[i];
+            if (i)
+                avio_w8(dyn, ',');
+            avio_w8(dyn, '{');
+            miku_write_json_string(dyn, "tb_num");
+            avio_w8(dyn, ':');
+            avio_printf(dyn, "%d", ch->time_base.num);
+            avio_w8(dyn, ',');
+            miku_write_json_string(dyn, "tb_den");
+            avio_w8(dyn, ':');
+            avio_printf(dyn, "%d", ch->time_base.den);
+            avio_w8(dyn, ',');
+            miku_write_json_string(dyn, "start");
+            avio_w8(dyn, ':');
+            avio_printf(dyn, "%lld", (long long)ch->start);
+            avio_w8(dyn, ',');
+            miku_write_json_string(dyn, "end");
+            avio_w8(dyn, ':');
+            avio_printf(dyn, "%lld", (long long)ch->end);
+            avio_w8(dyn, ',');
+            miku_write_json_string(dyn, "metadata");
+            avio_w8(dyn, ':');
+            miku_write_dict_json(dyn, ch->metadata);
+            avio_w8(dyn, '}');
+        }
+        avio_w8(dyn, ']');
+    }
+
     avio_w8(dyn, '}');
 
     *out_size = avio_close_dyn_buf(dyn, out_buf);
@@ -263,7 +341,7 @@ static int miku_flush_header_and_write(AVFormatContext *s)
     const AVPacketSideData *mdcv_sd, *clli_sd;
     int has_color_info;
 
-    ret = miku_build_metadata_json(s, &json, &json_size);
+    ret = miku_build_metadata_json(s, vst, ast, &json, &json_size);
     if (ret < 0)
         return ret;
 
@@ -495,17 +573,18 @@ static int miku_init(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    c->waiting_thumb = c->thumb_stream_idx >= 0;
+    c->waiting_thumb = c->thumb_stream_idx >= 0 || c->auto_thumbnail;
     return 0;
 }
 
 static int miku_write_header(AVFormatContext *s)
 {
     MikuMuxContext *c = s->priv_data;
-    // Common case: no attached-pic stream was declared, so there is nothing
-    // to wait for -- write the real header immediately. If a thumbnail
-    // stream *was* declared, defer (miku_resolve_header runs from
-    // write_packet once that packet, or proof there isn't one, shows up).
+    // No attached-pic stream declared AND auto_thumbnail is off: nothing to
+    // wait for, write the real header immediately. Otherwise defer --
+    // miku_resolve_header runs from write_packet once the explicit
+    // thumbnail packet arrives, or (auto_thumbnail's case) once the first
+    // video packet does, or once proof there isn't one shows up.
     if (!c->waiting_thumb)
         return miku_flush_header_and_write(s);
     return 0;
@@ -656,6 +735,26 @@ static int miku_write_packet(AVFormatContext *s, AVPacket *pkt)
         return miku_resolve_header(s);
     }
 
+    // Auto-thumbnail (no explicit attached-pic stream, auto_thumbnail on):
+    // the first video packet to arrive doubles as the thumbnail source.
+    // Frame 0 is always a real, standalone keyframe (see mikuenc.c), so its
+    // bytes are already valid, freestanding WebP data -- a copy, not a
+    // re-encode -- and it still gets written as a completely normal frame 0
+    // afterward via the fallthrough at the end of this function.
+    if (c->thumb_stream_idx < 0 && c->auto_thumbnail && !c->header_written &&
+        pkt->stream_index == c->video_stream_idx) {
+        av_freep(&c->thumb_data);
+        c->thumb_data = pkt->size ? av_memdup(pkt->data, pkt->size) : NULL;
+        if (pkt->size && !c->thumb_data)
+            return AVERROR(ENOMEM);
+        c->thumb_size = pkt->size;
+        c->waiting_thumb = 0;
+        ret = miku_resolve_header(s);
+        if (ret < 0)
+            return ret;
+        return miku_write_video_packet(s, pkt);
+    }
+
     if (!c->header_written) {
         if (c->waiting_thumb)
             return ff_packet_list_put(&c->queue, pkt, NULL, 0);
@@ -739,6 +838,26 @@ static void miku_deinit(AVFormatContext *s)
     ff_packet_list_free(&c->queue);
 }
 
+#define MOFFSET(x) offsetof(MikuMuxContext, x)
+#define ME AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption miku_mux_options[] = {
+    { "auto_thumbnail", "If no attached-picture thumbnail stream is provided (e.g. via "
+      "-map 1 -disposition:v:1 attached_pic), use the first video keyframe's own bytes "
+      "as one automatically instead of shipping with no thumbnail. Free: frame 0 is "
+      "already a real, standalone WebP keyframe by construction (see mikuenc.c), so this "
+      "is a byte copy, not a re-encode. Set to 0 to skip thumbnails entirely when none "
+      "was explicitly provided.",
+      MOFFSET(auto_thumbnail), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ME },
+    { NULL },
+};
+
+static const AVClass miku_muxer_class = {
+    .class_name = "miku",
+    .item_name  = av_default_item_name,
+    .option     = miku_mux_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
 const FFOutputFormat ff_miku_muxer = {
     .p.name         = "miku",
     .p.long_name    = NULL_IF_CONFIG_SMALL("MIKU Lossless Video"),
@@ -748,6 +867,7 @@ const FFOutputFormat ff_miku_muxer = {
     .p.audio_codec  = AV_CODEC_ID_FLAC,
     .p.video_codec  = AV_CODEC_ID_WEBP,
     .p.flags        = AVFMT_GLOBALHEADER | AVFMT_VARIABLE_FPS,
+    .p.priv_class   = &miku_muxer_class,
     .priv_data_size = sizeof(MikuMuxContext),
     .init           = miku_init,
     .write_header   = miku_write_header,

@@ -25,6 +25,7 @@
 #define MIKU_INDEX_ENTRY_SIZE  16
 #define MIKU_CODEC_FLAG_OFFSET 45
 #define MIKU_OFF_METADATA_OFF  22
+#define MIKU_OFF_VIDEO_OFF     46 // needed to size the implicitly-lengthed thumbnail; see miku_read_metadata_block
 #define MIKU_OFF_SAR_NUM       54
 #define MIKU_OFF_SAR_DEN       56
 #define MIKU_META_FLAG_THUMBNAIL 0x02
@@ -161,13 +162,344 @@ static int miku_parse_flac_header(MikuContext *m, AVIOContext *pb,
     return 0;
 }
 
-// Reads the META block at metadata_offset and, if present, reconstructs
+// ---- Minimal JSON reader for the META block's JSON metadata -------------
+//
+// Matches exactly what miku_build_metadata_json (mikumux.c) produces:
+// miku_write_json_string's escaping, flat objects of string:string pairs,
+// one level of nesting under __miku_streams, and an array of objects under
+// __miku_chapters. Deliberately not a general-purpose JSON parser -- same
+// "match exactly what we write, nothing more" spirit as the writer's own
+// hand-rolled string escaper. Any structure this doesn't recognize aborts
+// the metadata parse (see miku_parse_metadata_json's own comment for why
+// that's fine) rather than trying to skip unknown values generically.
+
+static void miku_json_skip_ws(const char **p)
+{
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r')
+        (*p)++;
+}
+
+// Parses a JSON string starting at **p (must point at the opening quote)
+// into a newly av_malloc'd, NUL-terminated buffer, and advances *p past the
+// closing quote. Returns NULL, leaving *p unchanged, on anything that isn't
+// a validly-escaped JSON string this format would ever actually write.
+static char *miku_json_parse_string(const char **p)
+{
+    const char *start, *scan;
+    int len = 0;
+    char *out, *w;
+
+    if (**p != '"')
+        return NULL;
+    scan = *p + 1;
+
+    // Pass 1: validate and compute the decoded length.
+    while (*scan && *scan != '"') {
+        if ((unsigned char)*scan == '\\') {
+            scan++;
+            switch (*scan) {
+            case '"': case '\\': case '/': case 'n': case 'r': case 't':
+                len++;
+                scan++;
+                break;
+            case 'u': {
+                int i;
+                for (i = 1; i <= 4; i++) {
+                    char h = scan[i];
+                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')))
+                        return NULL;
+                }
+                len += 3; // worst-case UTF-8 encoding of one BMP code point
+                scan += 5;
+                break;
+            }
+            default:
+                return NULL; // not an escape this format ever writes
+            }
+        } else {
+            len++;
+            scan++;
+        }
+    }
+    if (*scan != '"')
+        return NULL; // ran off the end without a closing quote
+
+    out = av_malloc(len + 1);
+    if (!out)
+        return NULL;
+    w = out;
+    start = *p + 1;
+    while (*start != '"') {
+        if ((unsigned char)*start == '\\') {
+            start++;
+            switch (*start) {
+            case '"':  *w++ = '"';  start++; break;
+            case '\\': *w++ = '\\'; start++; break;
+            case '/':  *w++ = '/';  start++; break;
+            case 'n':  *w++ = '\n'; start++; break;
+            case 'r':  *w++ = '\r'; start++; break;
+            case 't':  *w++ = '\t'; start++; break;
+            case 'u': {
+                unsigned cp = 0;
+                int i;
+                for (i = 1; i <= 4; i++) {
+                    char h = start[i];
+                    unsigned d = (h >= '0' && h <= '9') ? (unsigned)(h - '0')
+                                : (h >= 'a' && h <= 'f') ? (unsigned)(h - 'a' + 10)
+                                                          : (unsigned)(h - 'A' + 10);
+                    cp = (cp << 4) | d;
+                }
+                start += 5;
+                if (cp < 0x80) {
+                    *w++ = (char)cp;
+                } else if (cp < 0x800) {
+                    *w++ = (char)(0xC0 | (cp >> 6));
+                    *w++ = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    *w++ = (char)(0xE0 | (cp >> 12));
+                    *w++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    *w++ = (char)(0x80 | (cp & 0x3F));
+                }
+                break;
+            }
+            }
+        } else {
+            *w++ = *start;
+            start++;
+        }
+    }
+    *w = '\0';
+    *p = start + 1; // past the closing quote
+    return out;
+}
+
+// Parses a JSON integer: optional leading '-', digits only -- matches
+// exactly what avio_printf("%d"/"%lld", ...) writes for the chapter
+// fields, nothing fancier. Returns 0, leaving *p unchanged, on no match.
+static int miku_json_parse_int(const char **p, int64_t *out)
+{
+    const char *s = *p;
+    int neg = 0;
+    int64_t v = 0;
+    int any = 0;
+
+    if (*s == '-') { neg = 1; s++; }
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        s++;
+        any = 1;
+    }
+    if (!any)
+        return 0;
+    *out = neg ? -v : v;
+    *p = s;
+    return 1;
+}
+
+// Parses a flat {"key":"value",...} object starting at **p (opening brace)
+// and applies each entry to *dict via av_dict_set. Advances *p past the
+// closing brace. Returns <0, leaving *dict partially populated, on
+// malformed input -- callers treat that as "abandon the whole metadata
+// parse", so a partial dict never actually reaches the caller.
+static int miku_json_parse_dict(const char **p, AVDictionary **dict)
+{
+    miku_json_skip_ws(p);
+    if (**p != '{')
+        return AVERROR_INVALIDDATA;
+    (*p)++;
+    miku_json_skip_ws(p);
+    if (**p == '}') { (*p)++; return 0; }
+
+    for (;;) {
+        char *key, *val;
+        miku_json_skip_ws(p);
+        key = miku_json_parse_string(p);
+        if (!key)
+            return AVERROR_INVALIDDATA;
+        miku_json_skip_ws(p);
+        if (**p != ':') { av_free(key); return AVERROR_INVALIDDATA; }
+        (*p)++;
+        miku_json_skip_ws(p);
+        val = miku_json_parse_string(p);
+        if (!val) { av_free(key); return AVERROR_INVALIDDATA; }
+        // DONT_STRDUP_*: dict takes ownership of key/val either way,
+        // freeing them itself even if this particular set fails.
+        av_dict_set(dict, key, val, AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+        miku_json_skip_ws(p);
+        if (**p == ',') { (*p)++; continue; }
+        if (**p == '}') { (*p)++; break; }
+        return AVERROR_INVALIDDATA;
+    }
+    return 0;
+}
+
+// Parses the top-level object miku_build_metadata_json writes: flat
+// format-metadata keys verbatim (unchanged from the original item 7
+// behavior), plus __miku_streams (video/audio metadata) and
+// __miku_chapters if present. Malformed or unrecognized-shape JSON just
+// abandons the rest of the parse rather than failing the read -- metadata
+// is never load-bearing for whether the file plays, so a corrupt or
+// foreign-written META block should cost you tags/chapters, not the video.
+static void miku_parse_metadata_json(AVFormatContext *s, AVStream *vst, AVStream *ast,
+                                      const uint8_t *json, int json_len)
+{
+    char *buf = av_malloc(json_len + 1);
+    const char *p;
+    if (!buf)
+        return;
+    memcpy(buf, json, json_len);
+    buf[json_len] = '\0';
+    p = buf;
+
+    miku_json_skip_ws(&p);
+    if (*p != '{')
+        goto done;
+    p++;
+    miku_json_skip_ws(&p);
+    if (*p == '}')
+        goto done;
+
+    for (;;) {
+        char *key;
+        miku_json_skip_ws(&p);
+        key = miku_json_parse_string(&p);
+        if (!key)
+            goto done;
+        miku_json_skip_ws(&p);
+        if (*p != ':') { av_free(key); goto done; }
+        p++;
+        miku_json_skip_ws(&p);
+
+        if (!strcmp(key, "__miku_streams")) {
+            av_free(key);
+            miku_json_skip_ws(&p);
+            if (*p != '{') goto done;
+            p++;
+            miku_json_skip_ws(&p);
+            if (*p != '}') {
+                for (;;) {
+                    char *skey;
+                    AVDictionary **target;
+                    miku_json_skip_ws(&p);
+                    skey = miku_json_parse_string(&p);
+                    if (!skey) goto done;
+                    miku_json_skip_ws(&p);
+                    if (*p != ':') { av_free(skey); goto done; }
+                    p++;
+                    target = !strcmp(skey, "video") ? &vst->metadata
+                            : !strcmp(skey, "audio") ? &ast->metadata
+                                                      : NULL;
+                    av_free(skey);
+                    if (!target || miku_json_parse_dict(&p, target) < 0)
+                        goto done;
+                    miku_json_skip_ws(&p);
+                    if (*p == ',') { p++; continue; }
+                    if (*p == '}') { p++; break; }
+                    goto done;
+                }
+            } else {
+                p++;
+            }
+        } else if (!strcmp(key, "__miku_chapters")) {
+            av_free(key);
+            miku_json_skip_ws(&p);
+            if (*p != '[') goto done;
+            p++;
+            miku_json_skip_ws(&p);
+            if (*p != ']') {
+                for (;;) {
+                    int64_t tb_num = 1, tb_den = 1, start = 0, end = 0;
+                    AVDictionary *chmeta = NULL;
+                    AVChapter *ch;
+                    const AVDictionaryEntry *title_e;
+
+                    miku_json_skip_ws(&p);
+                    if (*p != '{') goto done;
+                    p++;
+                    miku_json_skip_ws(&p);
+                    if (*p != '}') {
+                        for (;;) {
+                            char *fkey;
+                            int64_t ival;
+                            miku_json_skip_ws(&p);
+                            fkey = miku_json_parse_string(&p);
+                            if (!fkey) { av_dict_free(&chmeta); goto done; }
+                            miku_json_skip_ws(&p);
+                            if (*p != ':') { av_free(fkey); av_dict_free(&chmeta); goto done; }
+                            p++;
+                            miku_json_skip_ws(&p);
+                            if (!strcmp(fkey, "metadata")) {
+                                if (miku_json_parse_dict(&p, &chmeta) < 0) {
+                                    av_free(fkey); av_dict_free(&chmeta); goto done;
+                                }
+                            } else if (!strcmp(fkey, "tb_num") || !strcmp(fkey, "tb_den") ||
+                                       !strcmp(fkey, "start")  || !strcmp(fkey, "end")) {
+                                if (!miku_json_parse_int(&p, &ival)) {
+                                    av_free(fkey); av_dict_free(&chmeta); goto done;
+                                }
+                                if      (!strcmp(fkey, "tb_num")) tb_num = ival;
+                                else if (!strcmp(fkey, "tb_den")) tb_den = ival;
+                                else if (!strcmp(fkey, "start"))  start  = ival;
+                                else                               end    = ival;
+                            } else {
+                                av_free(fkey); av_dict_free(&chmeta); goto done;
+                            }
+                            av_free(fkey);
+                            miku_json_skip_ws(&p);
+                            if (*p == ',') { p++; continue; }
+                            if (*p == '}') { p++; break; }
+                            av_dict_free(&chmeta);
+                            goto done;
+                        }
+                    } else {
+                        p++;
+                    }
+
+                    if (tb_den <= 0) tb_den = 1;
+                    title_e = av_dict_get(chmeta, "title", NULL, 0);
+                    ch = avpriv_new_chapter(s, s->nb_chapters,
+                                             (AVRational){ (int)tb_num, (int)tb_den },
+                                             start, end, title_e ? title_e->value : NULL);
+                    if (ch) {
+                        const AVDictionaryEntry *me = NULL;
+                        while ((me = av_dict_iterate(chmeta, me)))
+                            if (strcmp(me->key, "title")) // new_chapter already set title
+                                av_dict_set(&ch->metadata, me->key, me->value, 0);
+                    }
+                    av_dict_free(&chmeta);
+
+                    miku_json_skip_ws(&p);
+                    if (*p == ',') { p++; continue; }
+                    if (*p == ']') { p++; break; }
+                    goto done;
+                }
+            } else {
+                p++;
+            }
+        } else {
+            char *val = miku_json_parse_string(&p);
+            if (!val) { av_free(key); goto done; }
+            av_dict_set(&s->metadata, key, val, AV_DICT_DONT_STRDUP_VAL);
+            av_free(key);
+        }
+
+        miku_json_skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') { p++; break; }
+        goto done;
+    }
+
+done:
+    av_free(buf);
+}
+
+
 // color/HDR metadata onto vst->codecpar (bug-report follow-up: WebP's
 // bitstream has no field for this, so it's captured/restored at the
 // container level instead, mirroring how libavformat/movenc.c and mov.c
 // handle mdcv/clli). Only the color sub-block is actually parsed here; the
-// JSON metadata and any thumbnail are skipped over (not yet exposed by this
-// demuxer).
+// JSON metadata and any thumbnail are handled by the separate
+// miku_read_metadata_block below, once both streams exist.
 static int miku_parse_meta_block(AVFormatContext *s, AVStream *vst, int64_t metadata_offset)
 {
     AVIOContext *pb = s->pb;
@@ -224,6 +556,77 @@ static int miku_parse_meta_block(AVFormatContext *s, AVStream *vst, int64_t meta
                 return AVERROR_INVALIDDATA;
         } else {
             avio_skip(pb, sz);
+        }
+    }
+
+    return 0;
+}
+
+// Companion to miku_parse_meta_block above: re-seeks to the same META
+// block and reads its JSON portion for real, instead of skipping over it.
+// Split into a separate pass, called later in miku_read_header once both
+// streams exist (miku_parse_meta_block runs while only vst does, since the
+// color sub-block it handles only ever needed vst) -- the tiny duplicate
+// seek+read of the block header is negligible, this runs once per open.
+// Never fails the open: metadata is never load-bearing for whether the
+// file plays, so any problem here just means no metadata, not an error.
+static int miku_read_metadata_block(AVFormatContext *s, AVStream *vst, AVStream *ast,
+                                     int64_t metadata_offset, int64_t video_offset)
+{
+    AVIOContext *pb = s->pb;
+    uint8_t magic[4];
+    uint8_t flags;
+    uint32_t json_len;
+    uint8_t *json;
+    int ret;
+
+    avio_seek(pb, metadata_offset, SEEK_SET);
+    ret = avio_read(pb, magic, 4);
+    if (ret != 4 || memcmp(magic, "META", 4) != 0)
+        return 0; // no META block (older file, or offset unset)
+    flags = avio_r8(pb);
+    json_len = avio_rl32(pb);
+    if (json_len == 0 || json_len > 64 * 1024 * 1024) { // 0 = none; cap against a corrupt/hostile length
+        avio_skip(pb, json_len);
+    } else {
+        json = av_malloc(json_len);
+        if (json) {
+            ret = avio_read(pb, json, json_len);
+            if (ret == (int)json_len)
+                miku_parse_metadata_json(s, vst, ast, json, json_len);
+            // else: truncated META block -- treat as no metadata, not a hard failure
+            av_free(json);
+        }
+    }
+
+    // Thumbnail exposure. Structurally skip the color sub-block if present
+    // -- miku_parse_meta_block elsewhere in this file already extracts its
+    // actual values on its own separate pass; this one only needs to land
+    // at the right byte offset. Mirrors mikumux.c's own layout comment:
+    // "META"+json, [color block], [thumbnail], each self-describing except
+    // the thumbnail, whose length is implicitly "everything up to
+    // video_offset" (see that file for why it's written that way).
+    if (flags & MIKU_META_FLAG_COLOR) {
+        avio_skip(pb, 4); // primaries, trc, space, range
+        if (avio_r8(pb)) avio_skip(pb, avio_rl32(pb)); // mdcv, if present
+        if (avio_r8(pb)) avio_skip(pb, avio_rl32(pb)); // clli, if present
+    }
+    if (flags & MIKU_META_FLAG_THUMBNAIL) {
+        int64_t thumb_offset = avio_tell(pb);
+        int64_t thumb_size   = video_offset - thumb_offset;
+        // Real, standalone WebP bytes either way -- auto-generated
+        // thumbnails are frame 0's own bytes verbatim (see mikumux.c's
+        // write_packet), explicitly-provided ones are whatever the caller
+        // handed the thumbnail stream, itself required to already be a
+        // complete image. Exposed the standard FFmpeg way: a stream
+        // carrying AV_DISPOSITION_ATTACHED_PIC, decodable like any other
+        // single WebP image.
+        if (thumb_size > 0 && thumb_size <= 256 * 1024 * 1024) {
+            int ares = ff_add_attached_pic(s, NULL, pb, NULL, (int)thumb_size);
+            if (ares >= 0)
+                s->streams[s->nb_streams - 1]->codecpar->codec_id = AV_CODEC_ID_WEBP;
+            // else: non-fatal, same "metadata/extras never block the video
+            // itself" policy as everywhere else in this function
         }
     }
 
@@ -370,6 +773,12 @@ static int miku_read_header(AVFormatContext *s)
     if (ret < 0) return ret;
     m->audio_frame_end = audio_offset + audio_size;
     ffstream(ast)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
+
+    // Format/stream metadata + chapters: needs both streams to exist (see
+    // miku_read_metadata_block's own comment), so it runs here rather than
+    // alongside the color sub-block above.
+    miku_read_metadata_block(s, vst, ast, AV_RL64(header + MIKU_OFF_METADATA_OFF),
+                              AV_RL64(header + MIKU_OFF_VIDEO_OFF));
 
     // ---- Interleaving plan ----
     // The old code served every video packet before any audio packet, which

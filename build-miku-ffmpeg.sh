@@ -476,8 +476,8 @@ configure_and_build() {
         fi
     fi
 
-    if ! grep -q "^#define CONFIG_MIKU_ENCODER 1" config.h 2>/dev/null; then
-        warn "configure ran, but CONFIG_MIKU_ENCODER isn't enabled in config.h."
+    if ! grep -q "^CONFIG_MIKU_ENCODER=yes" ffbuild/config.mak 2>/dev/null; then
+        warn "configure ran, but CONFIG_MIKU_ENCODER isn't enabled in ffbuild/config.mak."
         warn "this almost always means libwebp wasn't detected at configure time -- check the 'libwebp' line in ffbuild/config.log."
         warn "continuing anyway so a real, specific error surfaces at build time instead of a silently incomplete build."
     fi
