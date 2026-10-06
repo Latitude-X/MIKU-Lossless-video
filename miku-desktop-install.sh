@@ -23,6 +23,22 @@
 #   --source-dir <path>   Directory with the miku*.c/.patch files and
 #                          build-miku-ffmpeg.sh. Default: this script's dir.
 #   --ref <git-ref>       FFmpeg ref to build. Default: master.
+#   --ffmpeg-build <full|basic|ask>
+#                          full: a normal FFmpeg build (every codec, format,
+#                          and filter upstream enables by default, plus
+#                          hardware acceleration and network streaming) --
+#                          matches or exceeds your system ffmpeg, capability
+#                          for capability, with .miku added on top.
+#                          basic: the same full codec/format/filter coverage,
+#                          but without hwaccel, network protocols, or
+#                          capture devices -- a real, complete ffmpeg for
+#                          file-to-file conversion, just leaner and faster
+#                          to build, and with fewer optional platform
+#                          dependencies that can fail to build on an
+#                          unusual system. Default: ask.
+#                          (The small static ffmpeg the thumbnailer uses is
+#                          separate from this choice and always minimal --
+#                          see build_thumb_ffmpeg's own comment for why.)
 #   --jobs <N>             Parallel build jobs. Default: nproc.
 #   --player <yes|no|ask>  Build mpv + wire up a player. Default: ask.
 #   --no-deps              Skip the OS package-manager dependency step.
@@ -129,6 +145,7 @@ PREFIX="$HOME/.local/miku"
 FFMPEG_REF="master"
 JOBS="$(nproc 2>/dev/null || echo 2)"
 PLAYER_MODE="ask"     # yes | no | ask
+FFMPEG_BUILD_TYPE="ask"   # full | basic | ask
 DO_DEPS=1
 
 print_help() {
@@ -143,6 +160,7 @@ while [ $# -gt 0 ]; do
         --ref)          FFMPEG_REF="$2"; shift 2 ;;
         --jobs)         JOBS="$2"; shift 2 ;;
         --player)       PLAYER_MODE="$2"; shift 2 ;;
+        --ffmpeg-build) FFMPEG_BUILD_TYPE="$2"; shift 2 ;;
         --no-deps)      DO_DEPS=0; shift ;;
         -h|--help)      print_help; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
@@ -202,6 +220,39 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
 fi
 
 mkdir -p "$PREFIX" "$BUILD_ROOT" "$BIN_DIR" "$MIME_DIR" "$THUMBNAILER_DIR" "$APPS_DIR" "$HELPERS_DIR"
+
+# Ask anything we need to ask now, together, before any long-running
+# (and backgrounded, spinner-driven) step starts -- so once the real work
+# begins you don't have to sit and babysit it for a prompt partway through
+# a build that can run well past an hour on --ffmpeg-build full.
+if [ "$FFMPEG_BUILD_TYPE" = "ask" ]; then
+    if [ "$IS_TTY" -eq 1 ]; then
+        printf "%sFull FFmpeg (every codec/format, hwaccel, network streaming -- matches your\n"  "$C_BOLD"
+        printf "system ffmpeg) or basic (same codec/format coverage, no hwaccel/network/\n"
+        printf "devices -- leaner, and fewer optional deps that can fail to build)? [F/b] %s" "$C_RESET"
+        read -r reply || reply="f"
+        case "$reply" in [bB]*) FFMPEG_BUILD_TYPE="basic" ;; *) FFMPEG_BUILD_TYPE="full" ;; esac
+    else
+        FFMPEG_BUILD_TYPE="full"
+    fi
+fi
+WANT_PLAYER=0
+case "$PLAYER_MODE" in
+    yes) WANT_PLAYER=1 ;;
+    no)  WANT_PLAYER=0 ;;
+    ask)
+        if [ "$IS_TTY" -eq 1 ]; then
+            printf "%sBuild mpv (and wire up Celluloid if present) so double-click just plays .miku files? [Y/n] %s" "$C_BOLD" "$C_RESET"
+            read -r reply || reply="y"
+            case "$reply" in [nN]*) WANT_PLAYER=0 ;; *) WANT_PLAYER=1 ;; esac
+        else
+            WANT_PLAYER=1
+        fi ;;
+esac
+say ""
+say "FFmpeg build : ${C_BOLD}$FFMPEG_BUILD_TYPE${C_RESET}"
+say "Player setup : ${C_BOLD}$([ "$WANT_PLAYER" -eq 1 ] && echo "yes" || echo "no")${C_RESET}"
+say "${C_DIM}(everything from here runs unattended)${C_RESET}"
 
 # ---------------------------------------------------------------------------
 # Dependencies (mpv's own deps, in addition to whatever build-miku-ffmpeg.sh
@@ -277,6 +328,18 @@ build_ffmpeg() {
     # is purely additive, for mpv and desktop-integration tools on top.
     # Some overlap (git, curl, pkg-config) is harmless.
     local extra_args="--enable-shared --disable-static"
+    # "basic" keeps every codec, container format, and filter upstream
+    # enables by default -- this is still a real, complete ffmpeg for
+    # file-to-file conversion -- and only drops three *categories* that
+    # aren't needed for that: hardware acceleration, network protocols,
+    # and capture/playback devices. Each of those also pulls in its own
+    # optional platform dependencies (CUDA/VAAPI/ALSA headers, etc.) that
+    # are a real, independent source of build failures on an unusual
+    # system, so "basic" is also the more reliably-buildable of the two,
+    # not just the smaller one.
+    if [ "$FFMPEG_BUILD_TYPE" = "basic" ]; then
+        extra_args="$extra_args --disable-hwaccels --disable-network --disable-devices"
+    fi
     local deps_flag=""
     [ "$DO_DEPS" -eq 1 ] || deps_flag="--no-deps"
     bash "$SOURCE_DIR/build-miku-ffmpeg.sh" \
@@ -499,19 +562,7 @@ run_step "Setting up thumbnail generation" setup_thumbnailer
 
 DEFAULT_DESKTOP_ID="mpv"
 PLAYER_BUILT=0
-WANT_PLAYER=0
-case "$PLAYER_MODE" in
-    yes) WANT_PLAYER=1 ;;
-    no)  WANT_PLAYER=0 ;;
-    ask)
-        if [ "$IS_TTY" -eq 1 ]; then
-            printf "%sBuild mpv (and wire up Celluloid if present) so double-click just plays .miku files? [Y/n] %s" "$C_BOLD" "$C_RESET"
-            read -r reply || reply="y"
-            case "$reply" in [nN]*) WANT_PLAYER=0 ;; *) WANT_PLAYER=1 ;; esac
-        else
-            WANT_PLAYER=1
-        fi ;;
-esac
+# WANT_PLAYER was already resolved during the upfront prompts above.
 
 if [ "$WANT_PLAYER" -eq 1 ]; then
     head_ "Player integration"
@@ -530,7 +581,7 @@ run_step "Setting the default .miku player" set_default_player "$DEFAULT_DESKTOP
 # Summary
 # ---------------------------------------------------------------------------
 head_ "Done"
-say "FFmpeg with .miku support: ${C_GREEN}$PREFIX/bin/ffmpeg${C_RESET}"
+say "FFmpeg with .miku support (${FFMPEG_BUILD_TYPE}): ${C_GREEN}$PREFIX/bin/ffmpeg${C_RESET}"
 say "  (open a new terminal, or 'source ~/.bashrc', for PATH to take effect)"
 if [ "$PLAYER_BUILT" -eq 1 ]; then
     say "Default .miku player: ${C_GREEN}$DEFAULT_DESKTOP_ID${C_RESET}"
