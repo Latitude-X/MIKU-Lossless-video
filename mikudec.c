@@ -3,11 +3,23 @@
 // Container: magic "MIKU", 64-byte header, per-frame index table (16 bytes/entry:
 // offset u64, size u32, duration u32), one trailing index entry for the audio blob,
 // video payload = lossless WebP frames, audio payload = a complete embedded FLAC
-// stream. Codec flag 0x01 (WebP) or 0x02 (WebP-delta, opt-in) are the only accepted
-// values (0x00, PNG, was supported pre-v1 and has been removed -- see miku_read_header).
+// stream. Codec flag 0x01 (WebP), 0x02 (WebP-delta, opt-in) or 0x03 (WebP-delta
+// with long-term references, see below) are the only accepted values (0x00, PNG,
+// was supported pre-v1 and has been removed -- see miku_read_header).
 // In delta mode only, each video index entry's size field has its MSB stolen as a
 // keyframe flag; see miku_get_index_entry and MIKU_CODEC_WEBP_DELTA in mikumux.c for
 // the full picture. Off by default -- non-delta files are read exactly as before.
+//
+// Format v3 (codec flag 0x03) adds LONG-TERM REFERENCES: a delta frame may
+// reconstruct against any keyframe in the file instead of the previous frame,
+// and the index entries widen to 24 bytes {offset u64, size u32, duration
+// u32, ref i32, reserved u32} to say which. Because a keyframe is a
+// standalone image, the referenced keyframe can sit anywhere -- before or
+// after the frame that uses it -- so for such a frame this demuxer hands the
+// decoder a self-contained packet: the frame's residual as the payload, plus
+// the referenced keyframe's bytes as AV_PKT_DATA_MIKU_REF_FRAME side data.
+// The decoder needs nothing else, which is also what makes seeking safe: a
+// frame with a reference is a chain root, exactly like a keyframe.
 
 #include "avformat.h"
 #include "demux.h"
@@ -22,7 +34,10 @@
 
 #define MIKU_MAGIC             MKTAG('M','I','K','U')
 #define MIKU_HEADER_SIZE       64
-#define MIKU_INDEX_ENTRY_SIZE  16
+#define MIKU_INDEX_ENTRY_SIZE  16 // v1/v2 entry stride; v3 uses MIKU_INDEX_ENTRY_SIZE_V3
+#define MIKU_INDEX_ENTRY_SIZE_V3 24
+#define MIKU_FORMAT_VERSION_MAX  3
+#define MIKU_OFF_VERSION       4
 #define MIKU_CODEC_FLAG_OFFSET 45
 #define MIKU_OFF_METADATA_OFF  22
 #define MIKU_OFF_VIDEO_OFF     46 // needed to size the implicitly-lengthed thumbnail; see miku_read_metadata_block
@@ -33,6 +48,8 @@
 #define MIKU_CODEC_WEBP        0x01
 #define MIKU_CODEC_WEBP_DELTA  0x02  // see mikumux.c -- keyframe bit stolen from each
                                       // video index entry's size MSB when this is set
+#define MIKU_CODEC_WEBP_DELTA_REFS 0x03 // delta mode + 24-byte entries carrying a
+                                         // long-term reference per frame (format v3)
 
 // Above this many frames, don't preload the whole index into RAM (item 7).
 // 1,000,000 frames in memory is ~16MB (3 arrays x 4-8 bytes); comfortably
@@ -53,6 +70,9 @@ typedef struct MikuContext {
     uint8_t *frame_keyframe;     // 1 byte/frame, NULL unless delta_mode (index_in_memory
                                   // path only -- the streaming/on-demand path re-derives
                                   // it per read in miku_get_index_entry instead)
+    int32_t *frame_ref;          // v3 only (NULL otherwise): index of the long-term
+                                  // reference keyframe per frame, -1 for none
+    int      entry_size;         // index stride: 16 (v1/v2) or 24 (v3)
     int      num_frames;
     int      current_frame;
     int64_t  next_pts;           // item 2 (VFR) fix: running sum of real per-frame
@@ -642,7 +662,7 @@ static int miku_read_header(AVFormatContext *s)
     uint8_t codec_flag;
     int64_t idx_off, audio_idx_pos, audio_offset;
     int32_t audio_size;
-    uint8_t entry[MIKU_INDEX_ENTRY_SIZE];
+    uint8_t entry[MIKU_INDEX_ENTRY_SIZE_V3];
     int ret;
 
     ret = avio_read(pb, header, MIKU_HEADER_SIZE);
@@ -660,6 +680,11 @@ static int miku_read_header(AVFormatContext *s)
     codec_flag          = header[MIKU_CODEC_FLAG_OFFSET];
 
     if (m->num_frames <= 0) return AVERROR_INVALIDDATA;
+    if (AV_RL16(header + MIKU_OFF_VERSION) > MIKU_FORMAT_VERSION_MAX) {
+        av_log(s, AV_LOG_ERROR, "Unsupported .miku format version %d (this build reads up to %d).\n",
+               AV_RL16(header + MIKU_OFF_VERSION), MIKU_FORMAT_VERSION_MAX);
+        return AVERROR_PATCHWELCOME;
+    }
 
     // ---- Video stream ----
     vst = avformat_new_stream(s, NULL);
@@ -670,13 +695,18 @@ static int miku_read_header(AVFormatContext *s)
     // values. Earlier format versions also supported PNG (codec flag 0x00);
     // that path produced scrambled video when a file's actual codec didn't
     // match the hardcoded decoder, and has been removed rather than fixed.
-    if (codec_flag != MIKU_CODEC_WEBP && codec_flag != MIKU_CODEC_WEBP_DELTA) {
+    if (codec_flag != MIKU_CODEC_WEBP && codec_flag != MIKU_CODEC_WEBP_DELTA &&
+        codec_flag != MIKU_CODEC_WEBP_DELTA_REFS) {
         av_log(s, AV_LOG_ERROR,
                "Unsupported .miku codec flag 0x%02x (PNG support was removed; "
-               "only WebP (0x01) or WebP-delta (0x02) are accepted).\n", codec_flag);
+               "only WebP (0x01), WebP-delta (0x02) or WebP-delta with long-term "
+               "references (0x03) are accepted).\n", codec_flag);
         return AVERROR_INVALIDDATA;
     }
-    m->delta_mode = (codec_flag == MIKU_CODEC_WEBP_DELTA);
+    m->delta_mode = (codec_flag == MIKU_CODEC_WEBP_DELTA ||
+                     codec_flag == MIKU_CODEC_WEBP_DELTA_REFS);
+    m->entry_size = (codec_flag == MIKU_CODEC_WEBP_DELTA_REFS) ? MIKU_INDEX_ENTRY_SIZE_V3
+                                                               : MIKU_INDEX_ENTRY_SIZE;
     vst->codecpar->codec_id = m->delta_mode ? AV_CODEC_ID_MIKU_DELTA : AV_CODEC_ID_WEBP;
     // codecpar->format is deliberately left at its default (AV_PIX_FMT_NONE):
     // WebP is a self-describing compressed bitstream, so the decoder
@@ -716,12 +746,17 @@ static int miku_read_header(AVFormatContext *s)
             if (!m->frame_keyframe)
                 return AVERROR(ENOMEM);
         }
+        if (m->entry_size == MIKU_INDEX_ENTRY_SIZE_V3) {
+            m->frame_ref = av_malloc_array(m->num_frames, sizeof(int32_t));
+            if (!m->frame_ref)
+                return AVERROR(ENOMEM);
+        }
 
         avio_seek(pb, idx_off, SEEK_SET);
         for (int i = 0; i < m->num_frames; i++) {
             uint32_t raw_size;
-            ret = avio_read(pb, entry, MIKU_INDEX_ENTRY_SIZE);
-            if (ret != MIKU_INDEX_ENTRY_SIZE) return AVERROR_INVALIDDATA;
+            ret = avio_read(pb, entry, m->entry_size);
+            if (ret != m->entry_size) return AVERROR_INVALIDDATA;
             m->frame_offsets[i]   = AV_RL64(entry);
             raw_size              = AV_RL32(entry + 8);
             m->frame_durations[i] = AV_RL32(entry + 12);
@@ -730,6 +765,25 @@ static int miku_read_header(AVFormatContext *s)
                 m->frame_sizes[i]    = (int32_t)(raw_size & 0x7FFFFFFFu);
             } else {
                 m->frame_sizes[i]    = (int32_t)raw_size;
+            }
+            if (m->frame_ref)
+                m->frame_ref[i] = (int32_t)AV_RL32(entry + 16);
+        }
+
+        // Every long-term reference must name a keyframe of this file, and
+        // only a delta frame may carry one. Verified once, up front, so a
+        // corrupt index fails the open instead of misdecoding mid-playback
+        // (the streaming path below re-checks each reference as it is used).
+        if (m->frame_ref) {
+            for (int i = 0; i < m->num_frames; i++) {
+                int32_t r = m->frame_ref[i];
+                if (r < 0)
+                    continue;
+                if (r >= m->num_frames || !m->frame_keyframe[r] || m->frame_keyframe[i]) {
+                    av_log(s, AV_LOG_ERROR,
+                           "Corrupt index: frame %d has an invalid long-term reference (%d)\n", i, r);
+                    return AVERROR_INVALIDDATA;
+                }
             }
         }
     } else {
@@ -740,10 +794,10 @@ static int miku_read_header(AVFormatContext *s)
     }
 
     // ---- Trailing index entry: audio blob location/size ----
-    audio_idx_pos = idx_off + (int64_t)m->num_frames * MIKU_INDEX_ENTRY_SIZE;
+    audio_idx_pos = idx_off + (int64_t)m->num_frames * m->entry_size;
     avio_seek(pb, audio_idx_pos, SEEK_SET);
-    ret = avio_read(pb, entry, MIKU_INDEX_ENTRY_SIZE);
-    if (ret != MIKU_INDEX_ENTRY_SIZE) return AVERROR_INVALIDDATA;
+    ret = avio_read(pb, entry, m->entry_size);
+    if (ret != m->entry_size) return AVERROR_INVALIDDATA;
     audio_offset = AV_RL64(entry);
     audio_size   = AV_RL32(entry + 8);
 
@@ -813,7 +867,7 @@ static int miku_read_header(AVFormatContext *s)
 // "size < 0 is corrupt data" guard downstream never sees a raw stolen bit.
 static int miku_get_index_entry(AVFormatContext *s, int i,
                                  int64_t *offset, int32_t *size, int32_t *duration,
-                                 int *is_keyframe)
+                                 int *is_keyframe, int32_t *ref)
 {
     MikuContext *m = s->priv_data;
 
@@ -822,22 +876,24 @@ static int miku_get_index_entry(AVFormatContext *s, int i,
         *size        = m->frame_sizes[i]; // already masked at load time
         *duration    = m->frame_durations[i];
         *is_keyframe = m->delta_mode ? m->frame_keyframe[i] : 1;
+        *ref         = m->frame_ref ? m->frame_ref[i] : -1;
         return 0;
     }
 
     {
         AVIOContext *pb = s->pb;
-        uint8_t entry[MIKU_INDEX_ENTRY_SIZE];
-        int64_t pos = m->index_table_offset + (int64_t)i * MIKU_INDEX_ENTRY_SIZE;
+        uint8_t entry[MIKU_INDEX_ENTRY_SIZE_V3];
+        int64_t pos = m->index_table_offset + (int64_t)i * m->entry_size;
         uint32_t raw_size;
         int ret;
 
         avio_seek(pb, pos, SEEK_SET);
-        ret = avio_read(pb, entry, MIKU_INDEX_ENTRY_SIZE);
-        if (ret != MIKU_INDEX_ENTRY_SIZE) return AVERROR_INVALIDDATA;
+        ret = avio_read(pb, entry, m->entry_size);
+        if (ret != m->entry_size) return AVERROR_INVALIDDATA;
         *offset  = AV_RL64(entry);
         raw_size = AV_RL32(entry + 8);
         *duration = AV_RL32(entry + 12);
+        *ref      = m->entry_size == MIKU_INDEX_ENTRY_SIZE_V3 ? (int32_t)AV_RL32(entry + 16) : -1;
         if (m->delta_mode) {
             *is_keyframe = (raw_size & 0x80000000u) ? 1 : 0;
             *size        = (int32_t)(raw_size & 0x7FFFFFFFu);
@@ -845,7 +901,7 @@ static int miku_get_index_entry(AVFormatContext *s, int i,
             *is_keyframe = 1;
             *size        = (int32_t)raw_size;
         }
-        m->file_pos = pos + MIKU_INDEX_ENTRY_SIZE; // fd moved; keep the cache honest
+        m->file_pos = pos + m->entry_size; // fd moved; keep the cache honest
         return 0;
     }
 }
@@ -856,10 +912,11 @@ static int miku_read_video_packet(AVFormatContext *s, AVPacket *pkt)
     AVIOContext *pb = s->pb;
     int64_t offset;
     int32_t size, duration;
+    int32_t ref;
     int is_keyframe;
     int ret;
 
-    ret = miku_get_index_entry(s, m->current_frame, &offset, &size, &duration, &is_keyframe);
+    ret = miku_get_index_entry(s, m->current_frame, &offset, &size, &duration, &is_keyframe, &ref);
     if (ret < 0) return ret;
     if (size < 0 || offset < 0)
         return AVERROR_INVALIDDATA; // corrupt index entry; don't hand a bogus size to av_new_packet
@@ -889,6 +946,59 @@ static int miku_read_video_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->flags |= AV_PKT_FLAG_KEY;
 
     m->file_pos = offset + size;
+
+    // Long-term reference: make the packet self-contained by attaching the
+    // referenced keyframe's own bytes. The keyframe may be anywhere in the
+    // file (earlier or later than this frame), so the decoder could never
+    // rely on having already seen it -- and after a seek it genuinely
+    // hasn't. The decoder keeps a small cache keyed by the frame number at
+    // the start of the payload, so for a run of frames sharing one reference
+    // the keyframe is decoded once, not once per frame; re-sending the
+    // compressed bytes costs one extra read from the page cache.
+    if (ref >= 0) {
+        int64_t roff;
+        int32_t rsize, rdur, rref;
+        int rkey;
+        uint8_t *sd;
+
+        // In-memory files were validated at open; streaming mode (index read
+        // on demand) has not been, so bound the reference here before it is
+        // used as an index into the table.
+        if (ref >= m->num_frames) {
+            av_log(s, AV_LOG_ERROR,
+                   "Corrupt index: frame %d has an invalid long-term reference (%d)\n",
+                   m->current_frame, ref);
+            av_packet_unref(pkt);
+            return AVERROR_INVALIDDATA;
+        }
+        ret = miku_get_index_entry(s, ref, &roff, &rsize, &rdur, &rkey, &rref);
+        if (ret < 0) {
+            av_packet_unref(pkt);
+            return ret;
+        }
+        if (!rkey || is_keyframe || roff < 0 || rsize <= 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "Corrupt index: frame %d has an invalid long-term reference (%d)\n",
+                   m->current_frame, ref);
+            av_packet_unref(pkt);
+            return AVERROR_INVALIDDATA;
+        }
+        sd = av_packet_new_side_data(pkt, AV_PKT_DATA_MIKU_REF_FRAME, 8 + (size_t)rsize);
+        if (!sd) {
+            av_packet_unref(pkt);
+            return AVERROR(ENOMEM);
+        }
+        AV_WL64(sd, (uint64_t)ref);
+        avio_seek(pb, roff, SEEK_SET);
+        ret = avio_read(pb, sd + 8, rsize);
+        if (ret != rsize) {
+            av_packet_unref(pkt);
+            m->file_pos = -1;
+            return AVERROR_EOF;
+        }
+        m->file_pos = roff + rsize;
+    }
+
     m->current_frame++;
     m->video_frames_since_audio++;
     return 0;
@@ -967,9 +1077,9 @@ static int64_t miku_frame_for_pts(AVFormatContext *s, int64_t target_pts)
     int i;
 
     for (i = 0; i < m->num_frames - 1; i++) {
-        int64_t off; int32_t sz, dur; int is_kf;
+        int64_t off; int32_t sz, dur, rf; int is_kf;
         int64_t d;
-        if (miku_get_index_entry(s, i, &off, &sz, &dur, &is_kf) < 0)
+        if (miku_get_index_entry(s, i, &off, &sz, &dur, &is_kf, &rf) < 0)
             break; // best effort -- caller clamps into [0, num_frames)
         d = dur > 0 ? dur : 1;
         if (cum + d > target_pts)
@@ -992,8 +1102,8 @@ static int64_t miku_cumulative_duration(AVFormatContext *s, int64_t upto_idx)
     int i;
 
     for (i = 0; i < upto_idx && i < m->num_frames; i++) {
-        int64_t off; int32_t sz, dur; int is_kf;
-        if (miku_get_index_entry(s, i, &off, &sz, &dur, &is_kf) < 0)
+        int64_t off; int32_t sz, dur, rf; int is_kf;
+        if (miku_get_index_entry(s, i, &off, &sz, &dur, &is_kf, &rf) < 0)
             break; // best effort -- a corrupt tail doesn't need to fail the seek
         cum += dur > 0 ? dur : 1;
     }
@@ -1033,7 +1143,8 @@ static int miku_read_seek(AVFormatContext *s, int stream_index,
 
         // Delta chains only carry real decoder state forward from a
         // keyframe (see the new decoder) -- decoding must start there, not
-        // mid-chain. Walk back to the nearest keyframe at or before
+        // mid-chain. Walk back to the nearest keyframe (or long-term-
+        // referencing frame, which is just as self-sufficient) at or before
         // frame_idx; normal sequential read_packet (and the decoder) catches
         // up to the originally requested frame from there. Non-delta files
         // skip this entirely: every frame is already a keyframe, so seeking
@@ -1041,10 +1152,14 @@ static int miku_read_seek(AVFormatContext *s, int stream_index,
         if (m->delta_mode) {
             int steps = 0;
             for (;;) {
-                int64_t off; int32_t sz, dur; int is_kf;
-                int ret = miku_get_index_entry(s, video_frame_idx, &off, &sz, &dur, &is_kf);
+                int64_t off; int32_t sz, dur, rf; int is_kf;
+                int ret = miku_get_index_entry(s, video_frame_idx, &off, &sz, &dur, &is_kf, &rf);
                 if (ret < 0) return ret;
-                if (is_kf) break;
+                // A keyframe is a decodable starting point, and so is a
+                // frame with a long-term reference: its packet carries the
+                // reference keyframe itself (see miku_read_video_packet), so
+                // nothing before it is needed.
+                if (is_kf || rf >= 0) break;
                 // Bounded at one block's worth of frames (the spec's 100-frame
                 // cap): an unbroken non-keyframe run longer than that is a
                 // corrupt index, not a legitimate chain -- fail cleanly rather
@@ -1096,6 +1211,7 @@ static int miku_read_close(AVFormatContext *s)
     av_freep(&m->frame_sizes);
     av_freep(&m->frame_durations);
     av_freep(&m->frame_keyframe);
+    av_freep(&m->frame_ref);
     return 0;
 }
 

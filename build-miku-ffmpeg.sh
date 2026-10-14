@@ -390,11 +390,46 @@ Check your network, or try a different --ref (a known release tag like n7.1 is a
 # ---------------------------------------------------------------------------
 # Patch application + file placement
 # ---------------------------------------------------------------------------
+# A checkout that an OLDER miku-support.patch already patched (before long-term
+# references existed) has everything except the AV_PKT_DATA_MIKU_REF_FRAME
+# side-data type that the demuxer, decoder and muxer now use -- and because the
+# main marker is already present, the patch itself is (rightly) not re-applied.
+# Add just that one enum entry in place, so a re-run upgrades such a checkout
+# instead of dying with an undeclared-identifier error halfway through the build.
+upgrade_old_miku_patch() {
+    local header=libavcodec/packet.h block
+    grep -q "AV_PKT_DATA_MIKU_REF_FRAME" "$header" 2>/dev/null && return 0
+    grep -q '^    AV_PKT_DATA_MIKU_IS_DELTA,$' "$header" 2>/dev/null \
+        || die "this checkout has a miku patch I don't recognize ($header has no AV_PKT_DATA_MIKU_IS_DELTA entry in the expected form).
+Re-run with --clean to start from a fresh checkout."
+    log "this checkout carries an older miku patch; adding AV_PKT_DATA_MIKU_REF_FRAME to $header"
+    block="$(mktemp)"
+    cat > "$block" <<'BLOCK_EOF'
+
+    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder. Attached to a delta
+    // packet whose reference is a long-term keyframe rather than the
+    // previous frame. Payload: little-endian int64 frame number of that
+    // keyframe, followed by the keyframe's own complete WebP bytes. Makes
+    // the packet self-contained, so the referenced keyframe may be anywhere
+    // in the file, before or after the frame using it. See mikudec.c and
+    // mikudeltadec.c.
+    AV_PKT_DATA_MIKU_REF_FRAME,
+BLOCK_EOF
+    awk -v blockfile="$block" '
+        { print }
+        /^    AV_PKT_DATA_MIKU_IS_DELTA,$/ { while ((getline line < blockfile) > 0) print line }
+    ' "$header" > "$header.miku-new" && mv "$header.miku-new" "$header"
+    rm -f "$block"
+    grep -q "AV_PKT_DATA_MIKU_REF_FRAME" "$header" || die "failed to upgrade $header"
+    ok "upgraded $header"
+}
+
 apply_miku_patch() {
     cd "$BUILD_DIR"
 
     if grep -q "AV_CODEC_ID_MIKU_DELTA" libavcodec/codec_id.h 2>/dev/null; then
         log "miku patch already applied in this checkout, skipping re-apply"
+        upgrade_old_miku_patch
     else
         log "applying miku-support.patch"
         if git apply --check "$SOURCE_DIR/miku-support.patch" 2>/dev/null; then
@@ -428,6 +463,7 @@ and fix up whatever .rej files that leaves behind."
         "libavcodec/allcodecs.c:ff_miku_encoder" \
         "libavcodec/codec_id.h:AV_CODEC_ID_MIKU_DELTA" \
         "libavcodec/packet.h:AV_PKT_DATA_MIKU_IS_DELTA" \
+        "libavcodec/packet.h:AV_PKT_DATA_MIKU_REF_FRAME" \
         "libavformat/Makefile:CONFIG_MIKU_MUXER" \
         "libavformat/allformats.c:ff_miku_muxer" \
     ; do

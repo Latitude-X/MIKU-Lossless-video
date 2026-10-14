@@ -83,7 +83,27 @@
 //          decoder with its own row-by-row loop.
 //     No AVOptions; DR1 (buffer delegation) and FRAME_THREADS are the only
 //     capabilities needed.
+//
+//   - LONG-TERM REFERENCES (format v3). A delta packet may carry
+//     AV_PKT_DATA_MIKU_REF_FRAME side data: the frame number of a keyframe
+//     plus that keyframe's own WebP bytes (attached by mikudec.c). Such a
+//     frame reconstructs against that keyframe instead of the previous
+//     frame, which has two consequences here:
+//       * It is a chain root, like a keyframe: it needs nothing from `prev`,
+//         so it never calls ff_progress_frame_await and decodes fully in
+//         parallel with its neighbours, and it is valid right after a seek.
+//       * The keyframe must be decoded to be used. A run of frames often
+//         shares one reference (a returning scene, a periodic re-root of a
+//         static shot), so decoded references live in a small cache keyed by
+//         the keyframe's compressed bytes (frame numbers are only meaningful
+//         within one file). The cache is shared by every frame-thread context
+//         through update_thread_context (an AVBufferRef to one locked
+//         object); entries are immutable once inserted, so readers need no
+//         lock beyond the lookup itself. Two threads that miss on the same
+//         keyframe at the same moment both decode it -- harmless duplicated
+//         work, never a wrong result.
 
+#include <inttypes.h>
 #include <limits.h>
 #include <string.h>
 
@@ -94,6 +114,34 @@
 #include "decode.h"
 #include "progressframe.h"
 #include "thread.h"
+#include "libavutil/buffer.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
+#include "libavutil/thread.h"
+
+// Decoded long-term reference keyframes kept ready for reuse. A few is
+// plenty: playback normally leans on one or two references at a time.
+#define MIKU_REF_CACHE_N 4
+
+// Entries are matched by the keyframe's compressed BYTES, not by the frame
+// number the demuxer reports: that number is only meaningful inside one file,
+// and a decoder can be fed several (the concat demuxer, a playlist), where two
+// different files both have a "frame 0". Comparing the bytes is exact, and
+// costs a memcmp per long-term-reference frame -- these are chain roots, a
+// small fraction of all frames, and the compare is far cheaper than the decode
+// it saves.
+typedef struct MikuRefEntry {
+    AVBufferRef *bytes; // the compressed keyframe this entry was decoded from
+    AVBufferRef *buf;   // decoded BGRA, tightly packed (stride == width * 4)
+    uint64_t     stamp; // LRU clock value at last use
+} MikuRefEntry;
+
+typedef struct MikuRefCache {
+    AVMutex      lock;  // guards ent[] and clock; the pixel data itself is
+                        // immutable once an entry is inserted
+    MikuRefEntry ent[MIKU_REF_CACHE_N];
+    uint64_t     clock;
+} MikuRefCache;
 
 typedef struct MikuDeltaDecContext {
     // The immediately preceding frame in this chain, shared (ref-counted,
@@ -111,7 +159,128 @@ typedef struct MikuDeltaDecContext {
     // that's fine (progress tracking, not the reference itself, is what
     // makes waiting for the pixels safe).
     ProgressFrame cur;
+    // Long-term reference cache, shared by all frame-thread contexts (see
+    // the header comment). Never NULL after a successful init.
+    AVBufferRef *cache_ref;
 } MikuDeltaDecContext;
+
+static void miku_ref_cache_free(void *opaque, uint8_t *data)
+{
+    MikuRefCache *c = (MikuRefCache *)data;
+    for (int i = 0; i < MIKU_REF_CACHE_N; i++) {
+        av_buffer_unref(&c->ent[i].buf);
+        av_buffer_unref(&c->ent[i].bytes);
+    }
+    ff_mutex_destroy(&c->lock);
+    av_free(c);
+}
+
+static AVBufferRef *miku_ref_cache_new(void)
+{
+    MikuRefCache *c = av_mallocz(sizeof(*c));
+    AVBufferRef *ref;
+
+    if (!c)
+        return NULL;
+    if (ff_mutex_init(&c->lock, NULL)) {
+        av_free(c);
+        return NULL;
+    }
+    ref = av_buffer_create((uint8_t *)c, sizeof(*c), miku_ref_cache_free, NULL, 0);
+    if (!ref) {
+        ff_mutex_destroy(&c->lock);
+        av_free(c);
+        return NULL;
+    }
+    return ref;
+}
+
+// Returns (through *out, a new reference the caller must unref) the decoded
+// pixels of the long-term reference keyframe whose compressed bytes are
+// data[0..size), decoding it into the cache first if it isn't there yet.
+// Pixels are tightly packed BGRA. `id` (the frame number) is for messages only.
+static int miku_ref_get(AVCodecContext *avctx, AVBufferRef *cache_ref, int64_t id,
+                        const uint8_t *data, size_t size, AVBufferRef **out)
+{
+    MikuRefCache *c = (MikuRefCache *)cache_ref->data;
+    int64_t need = (int64_t)avctx->width * avctx->height * 4;
+    // Decoded keyframes are full frames; keep the cache's footprint bounded
+    // for very large pictures (the minimum is always one entry).
+    int slots = FFMAX(1, FFMIN(MIKU_REF_CACHE_N, (int)((256LL << 20) / FFMAX(need, 1))));
+    AVBufferRef *buf, *bytes;
+    int w, h, victim = 0;
+
+    ff_mutex_lock(&c->lock);
+    for (int i = 0; i < slots; i++) {
+        if (c->ent[i].buf && c->ent[i].bytes->size == size &&
+            !memcmp(c->ent[i].bytes->data, data, size)) {
+            c->ent[i].stamp = ++c->clock;
+            *out = av_buffer_ref(c->ent[i].buf);
+            ff_mutex_unlock(&c->lock);
+            return *out ? 0 : AVERROR(ENOMEM);
+        }
+    }
+    ff_mutex_unlock(&c->lock);
+
+    // Miss: decode it (outside the lock -- this is the slow part).
+    if (size > INT_MAX || !WebPGetInfo(data, size, &w, &h) ||
+        w != avctx->width || h != avctx->height) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Invalid long-term reference keyframe (frame %"PRId64")\n", id);
+        return AVERROR_INVALIDDATA;
+    }
+    buf = av_buffer_alloc(need);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    if (!WebPDecodeBGRAInto(data, size, buf->data, need, avctx->width * 4)) {
+        av_log(avctx, AV_LOG_ERROR,
+               "libwebp decode failed (long-term reference, frame %"PRId64")\n", id);
+        av_buffer_unref(&buf);
+        return AVERROR_EXTERNAL;
+    }
+
+    // Keep a private copy of the compressed bytes as the cache key (the
+    // packet's side data goes away with the packet). If either allocation
+    // fails the frame is still decoded correctly; it just isn't cached.
+    bytes = av_buffer_alloc(size);
+    if (bytes)
+        memcpy(bytes->data, data, size);
+
+    ff_mutex_lock(&c->lock);
+    for (int i = 0; i < slots; i++) {
+        if (c->ent[i].buf && c->ent[i].bytes->size == size &&
+            !memcmp(c->ent[i].bytes->data, data, size)) {
+            // Another thread decoded the same keyframe meanwhile; keep
+            // theirs in the cache and just use ours for this one frame.
+            c->ent[i].stamp = ++c->clock;
+            ff_mutex_unlock(&c->lock);
+            av_buffer_unref(&bytes);
+            *out = buf;
+            return 0;
+        }
+    }
+    for (int i = 0; i < slots; i++) {
+        if (!c->ent[i].buf) { victim = i; break; }
+        if (c->ent[i].stamp < c->ent[victim].stamp)
+            victim = i;
+    }
+    if (bytes) {
+        AVBufferRef *keep = av_buffer_ref(buf); // NULL just means: don't cache
+        if (keep) {
+            // Readers hold their own references, so dropping the victim's is safe.
+            av_buffer_unref(&c->ent[victim].buf);
+            av_buffer_unref(&c->ent[victim].bytes);
+            c->ent[victim].buf   = keep;
+            c->ent[victim].bytes = bytes;
+            c->ent[victim].stamp = ++c->clock;
+            bytes = NULL;
+        }
+    }
+    ff_mutex_unlock(&c->lock);
+    av_buffer_unref(&bytes); // still ours only if it was not cached
+    *out = buf;
+    return 0;
+}
 
 static av_cold int miku_delta_decode_init(AVCodecContext *avctx)
 {
@@ -119,7 +288,13 @@ static av_cold int miku_delta_decode_init(AVCodecContext *avctx)
     // input format -- delta reconstruction is only meaningful in the exact
     // pixel layout the encoder computed residuals in. No format-negotiation
     // machinery needed for a single always-used format.
+    MikuDeltaDecContext *s = avctx->priv_data;
+
     avctx->pix_fmt = AV_PIX_FMT_BGRA;
+
+    s->cache_ref = miku_ref_cache_new();
+    if (!s->cache_ref)
+        return AVERROR(ENOMEM);
     return 0;
 }
 
@@ -128,6 +303,7 @@ static av_cold int miku_delta_decode_close(AVCodecContext *avctx)
     MikuDeltaDecContext *s = avctx->priv_data;
     ff_progress_frame_unref(&s->cur);
     ff_progress_frame_unref(&s->prev);
+    av_buffer_unref(&s->cache_ref);
     return 0;
 }
 
@@ -168,6 +344,17 @@ static int miku_delta_update_thread_context(AVCodecContext *avctx,
     if (src->cur.f)
         ff_progress_frame_ref(&dst->prev, &src->cur);
 
+    // Converge every thread context on one shared reference cache. Each
+    // context starts with a private one from init(); after the first lap of
+    // the round-robin they all point at the same object, so a reference
+    // keyframe is decoded once for all threads, not once per thread.
+    if (src->cache_ref && dst->cache_ref != src->cache_ref) {
+        av_buffer_unref(&dst->cache_ref);
+        dst->cache_ref = av_buffer_ref(src->cache_ref);
+        if (!dst->cache_ref)
+            return AVERROR(ENOMEM);
+    }
+
     return 0;
 }
 #endif
@@ -177,6 +364,12 @@ static int miku_delta_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 {
     MikuDeltaDecContext *s = avctx->priv_data;
     int is_keyframe = (avpkt->flags & AV_PKT_FLAG_KEY) != 0;
+    size_t ref_sd_size = 0;
+    const uint8_t *ref_sd = av_packet_get_side_data(avpkt, AV_PKT_DATA_MIKU_REF_FRAME,
+                                                     &ref_sd_size);
+    // A delta frame with a long-term reference: self-contained, a chain root.
+    int has_ref = !is_keyframe && ref_sd && ref_sd_size > 8;
+    AVBufferRef *refbuf = NULL;
     int webp_w, webp_h;
     int ret;
 
@@ -185,7 +378,7 @@ static int miku_delta_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return 0;
     }
 
-    if (!is_keyframe && !s->prev.f) {
+    if (!is_keyframe && !has_ref && !s->prev.f) {
         // A delta packet with no prior reference means either a corrupt
         // stream or (more likely, if this ever fires) a bug in the
         // demuxer's seek-snapping -- landing anywhere other than exactly a
@@ -264,6 +457,29 @@ static int miku_delta_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                 ret = AVERROR_EXTERNAL;
                 goto finish;
             }
+        } else if (has_ref) {
+            // Delta against a long-term reference keyframe. Everything this
+            // needs is in the packet itself (see mikudec.c), so there is no
+            // wait on `prev` and no ordering against other threads at all.
+            ret = miku_ref_get(avctx, s->cache_ref, (int64_t)AV_RL64(ref_sd),
+                               ref_sd + 8, ref_sd_size - 8, &refbuf);
+            if (ret < 0)
+                goto finish;
+            if (!WebPDecodeBGRAInto(avpkt->data, avpkt->size, out, out_size, out_stride)) {
+                av_log(avctx, AV_LOG_ERROR, "libwebp decode failed (delta residual, long-term ref)\n");
+                ret = AVERROR_EXTERNAL;
+                goto finish;
+            }
+            {
+                const uint8_t *ref = refbuf->data;
+                int ref_stride = avctx->width * 4; // tightly packed, see miku_ref_get
+                for (int y = 0; y < avctx->height; y++) {
+                    uint8_t       *row     = out + (int64_t)y * out_stride;
+                    const uint8_t *ref_row = ref + (int64_t)y * ref_stride;
+                    for (int x = 0; x < webp_w * 4; x++)
+                        row[x] = (uint8_t)(ref_row[x] + row[x]);
+                }
+            }
         } else {
             // Delta: decode the residual into this frame's own buffer
             // first -- safe and independent, doesn't touch the reference --
@@ -306,6 +522,7 @@ static int miku_delta_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     ret = avpkt->size;
 
 finish:
+    av_buffer_unref(&refbuf);
     // Must run on every path past the allocation above, success or
     // failure: anything already waiting on this frame (a genuinely
     // concurrent thread, since we called ff_thread_finish_setup early)

@@ -1,8 +1,8 @@
 diff --git a/configure b/configure
-index 9dd11e7..7038a93 100755
+index f542d4e..17f066b 100755
 --- a/configure
 +++ b/configure
-@@ -3219,6 +3219,8 @@ magicyuv_decoder_select="llviddsp"
+@@ -3196,6 +3196,8 @@ magicyuv_decoder_select="llviddsp"
  magicyuv_encoder_select="llvidencdsp"
  mdec_decoder_select="blockdsp bswapdsp idctdsp"
  media100_decoder_select="media100_to_mjpegb_bsf mjpegb_decoder"
@@ -11,7 +11,7 @@ index 9dd11e7..7038a93 100755
  metasound_decoder_select="lsp sinewin"
  mimic_decoder_select="blockdsp bswapdsp hpeldsp idctdsp"
  mjpeg_decoder_select="blockdsp idctdsp jpegtables"
-@@ -7469,7 +7471,8 @@ enabled libvpx            && {
+@@ -7386,7 +7388,8 @@ enabled libvpx            && {
  
  enabled libvvenc          && require_pkg_config libvvenc "libvvenc >= 1.6.1" "vvenc/vvenc.h" vvenc_get_version
  enabled libwebp           && {
@@ -22,10 +22,10 @@ index 9dd11e7..7038a93 100755
  enabled libx264           && require_pkg_config libx264 x264 "stdint.h x264.h" x264_encoder_encode &&
                               require_cpp_condition libx264 x264.h "X264_BUILD >= 155" && {
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index 16d60b2..cfcb641 100644
+index 3d2200a..1624034 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -1233,6 +1233,8 @@ OBJS-$(CONFIG_LIBVPX_VP9_ENCODER)         += libvpxenc.o
+@@ -1240,6 +1240,8 @@ OBJS-$(CONFIG_LIBVPX_VP9_ENCODER)         += libvpxenc.o
  OBJS-$(CONFIG_LIBVVENC_ENCODER)           += libvvenc.o
  OBJS-$(CONFIG_LIBWEBP_ENCODER)            += libwebpenc_common.o libwebpenc.o
  OBJS-$(CONFIG_LIBWEBP_ANIM_ENCODER)       += libwebpenc_common.o libwebpenc_animencoder.o
@@ -35,7 +35,7 @@ index 16d60b2..cfcb641 100644
  OBJS-$(CONFIG_LIBX264_ENCODER)            += libx264.o
  OBJS-$(CONFIG_LIBX265_ENCODER)            += libx265.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index 2d7496a..a463773 100644
+index 178a0e5..90a9366 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
 @@ -196,6 +196,8 @@ extern const FFCodec ff_magicyuv_encoder;
@@ -48,67 +48,53 @@ index 2d7496a..a463773 100644
  extern const FFCodec ff_mjpeg_encoder;
  extern const FFCodec ff_mjpeg_decoder;
 diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
-index f5f2b17..fdb59b9 100644
+index e91366f..fc9e1e1 100644
 --- a/libavcodec/codec_desc.c
 +++ b/libavcodec/codec_desc.c
-@@ -1992,6 +1992,31 @@ static const AVCodecDescriptor codec_descriptors[] = {
-         .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_LOSSLESS,
-         .mime_types= MT("image/webp"),
+@@ -2010,6 +2010,23 @@ static const AVCodecDescriptor codec_descriptors[] = {
+         .mime_types= MT("image/x-panasonic-rw2"),
      },
+ 
 +    {
 +        .id        = AV_CODEC_ID_MIKU_DELTA,
 +        .type      = AVMEDIA_TYPE_VIDEO,
 +        .name      = "miku_delta",
 +        .long_name = NULL_IF_CONFIG_SMALL(".miku delta-frame residual"),
-+        // Deliberately NOT AV_CODEC_PROP_INTRA_ONLY, unlike plain webp right
-+        // above (matching webp_anim's own precedent immediately above this,
-+        // for the same reason): a delta packet has a real, required
-+        // dependency on the previously decoded frame. Getting this wrong
-+        // would silently reintroduce, on this decoder's *output* frames,
-+        // the same class of bug already found and fixed on the *encoder's*
-+        // output packets (see mikuenc.c's capabilities comment and
-+        // AV_PKT_DATA_MIKU_IS_DELTA's comment in packet.h) -- the generic
-+        // decode pipeline forces AV_FRAME_FLAG_KEY onto every output frame
-+        // for a codec whose descriptor claims AV_CODEC_PROP_INTRA_ONLY
-+        // (libavcodec/decode.c, mirroring encode.c's mechanism), which
-+        // would be actively wrong for delta frames.
++        // Deliberately NOT AV_CODEC_PROP_INTRA_ONLY, unlike plain webp: a
++        // delta packet has a real, required dependency on a previously
++        // decoded frame. The generic decode pipeline forces AV_FRAME_FLAG_KEY
++        // onto every output frame for a codec whose descriptor claims
++        // INTRA_ONLY, which would be actively wrong for delta frames.
 +        //
-+        // This entry's mere presence (regardless of props) is what's
-+        // actually required, not just descriptive: verified via a real
-+        // crash that ff_decode_preinit (libavcodec/decode.c) unconditionally
-+        // dereferences avctx->codec_descriptor->props with no NULL check,
-+        // which is NULL for any codec_id lacking an entry here at all.
++        // This entry's mere presence (regardless of props) is also required:
++        // ff_decode_preinit dereferences avctx->codec_descriptor->props with
++        // no NULL check, and it is NULL for any codec_id lacking an entry.
 +        .props     = AV_CODEC_PROP_LOSSLESS,
 +    },
- 
++
      /* various PCM "codecs" */
      {
+         .id        = AV_CODEC_ID_PCM_S16LE,
 diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
-index 7cafac6..c637f6d 100644
+index 0133751..236b6e6 100644
 --- a/libavcodec/codec_id.h
 +++ b/libavcodec/codec_id.h
-@@ -325,6 +325,28 @@ enum AVCodecID {
-     AV_CODEC_ID_JPEGXS,
-     AV_CODEC_ID_WEBP_ANIM,
+@@ -327,6 +327,22 @@ enum AVCodecID {
+     AV_CODEC_ID_ASTC,
+     AV_CODEC_ID_RW2,
  
 +    // ---- .miku fork-local additions ----
 +    // Value chosen explicitly (not auto-assigned) so it survives `git pull`
-+    // merges against upstream FFmpeg without renumbering. Verified against a
-+    // real clone of upstream FFmpeg: the last real assigned video ID above is
-+    // AV_CODEC_ID_WEBP_ANIM, and the entire video ID range is one unbroken
-+    // sequential block with no other explicit numeric assignment anywhere in
-+    // it, all the way up to AV_CODEC_ID_FIRST_AUDIO (0x10000) -- so
-+    // 0x112..0xFFFF (65,262 values) are genuinely free today. This is placed
-+    // near the top of that range, far from where upstream sequentially
-+    // appends new IDs (currently at 0x112), to stay safe across years of
-+    // future upstream syncs. AVCodecID has no documented "private use" block
-+    // of its own (unlike e.g. RIFF FourCCs or Matroska CodecID strings) --
-+    // it's FFmpeg's own internal enum, not a wire format, so a fork-local
-+    // unused value is the correct mechanism here, not a workaround.
++    // merges against upstream FFmpeg without renumbering. The video ID range
++    // is one unbroken sequential block with no other explicit numeric
++    // assignment in it, all the way up to AV_CODEC_ID_FIRST_AUDIO (0x10000),
++    // so a value near the top of that range stays clear of where upstream
++    // sequentially appends new IDs. AVCodecID has no documented "private
++    // use" block -- it's FFmpeg's own internal enum, not a wire format, so a
++    // fork-local unused value is the correct mechanism here.
 +    //
 +    // Reserve the top of the range downward for any future fork-local codec
-+    // IDs so they stay grouped together rather than re-verified from scratch
-+    // each time.
++    // IDs so they stay grouped together.
 +    AV_CODEC_ID_MIKU_DELTA = 0xFFFE, ///< .miku delta-frame residual (opt-in -delta_frames).
 +                                      ///< NOT standalone WebP bytes -- decoding requires
 +                                      ///< ff_miku_delta_decoder, never the stock webp decoder.
@@ -117,20 +103,25 @@ index 7cafac6..c637f6d 100644
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
      AV_CODEC_ID_PCM_S16LE = 0x10000,
 diff --git a/libavcodec/packet.h b/libavcodec/packet.h
-index 00774a7..ba7ad67 100644
+index 00774a7..f5468ca 100644
 --- a/libavcodec/packet.h
 +++ b/libavcodec/packet.h
-@@ -383,6 +383,27 @@ enum AVPacketSideDataType {
+@@ -383,6 +383,41 @@ enum AVPacketSideDataType {
       */
      AV_PKT_DATA_HEVC_CONF,
  
-+    // ---- .miku fork-local addition ----
-+    // Presence (any size, content unused) on a packet from the "miku"
++    // ---- .miku fork-local additions ----
++    // Purely in-process signals between the miku encoder, muxer, demuxer and
++    // decoder, never serialized to disk as such, so (unlike
++    // AV_CODEC_ID_MIKU_DELTA) they don't need explicit, collision-resistant
++    // numeric values; plain sequential entries are safe.
++    //
++    // AV_PKT_DATA_MIKU_IS_DELTA: presence on a packet from the "miku"
 +    // encoder means "this is a delta-chain frame, not a keyframe" -- see
-+    // mikuenc.c and mikumux.c. Purely an in-process signal between this
-+    // encoder and this muxer, never serialized to disk, so (unlike
-+    // AV_CODEC_ID_MIKU_DELTA) it doesn't need an explicit,
-+    // collision-resistant numeric value; a plain sequential entry is safe.
++    // mikuenc.c and mikumux.c. An empty/1-byte payload means the delta is
++    // against the previous frame; an 8-byte payload (little-endian int64) is
++    // the frame number of a LONG-TERM REFERENCE keyframe the delta is
++    // against instead.
 +    //
 +    // Why this exists instead of AV_PKT_FLAG_KEY: verified directly against
 +    // libavcodec/encode.c that AV_CODEC_ID_WEBP's codec descriptor has
@@ -145,14 +136,23 @@ index 00774a7..ba7ad67 100644
 +    // side data isn't touched by that mechanism, so it does.
 +    AV_PKT_DATA_MIKU_IS_DELTA,
 +
++    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder. Attached to a delta
++    // packet whose reference is a long-term keyframe rather than the
++    // previous frame. Payload: little-endian int64 frame number of that
++    // keyframe, followed by the keyframe's own complete WebP bytes. Makes
++    // the packet self-contained, so the referenced keyframe may be anywhere
++    // in the file, before or after the frame using it. See mikudec.c and
++    // mikudeltadec.c.
++    AV_PKT_DATA_MIKU_REF_FRAME,
++
      /**
       * The number of side data types.
       * This is not part of the public API/ABI in the sense that it may
 diff --git a/libavformat/Makefile b/libavformat/Makefile
-index 466f5d1..c13c677 100644
+index 302df28..ed899be 100644
 --- a/libavformat/Makefile
 +++ b/libavformat/Makefile
-@@ -377,6 +377,8 @@ OBJS-$(CONFIG_MD5_MUXER)                 += hashenc.o
+@@ -383,6 +383,8 @@ OBJS-$(CONFIG_MD5_MUXER)                 += hashenc.o
  OBJS-$(CONFIG_MGSTS_DEMUXER)             += mgsts.o
  OBJS-$(CONFIG_MICRODVD_DEMUXER)          += microdvddec.o subtitles.o
  OBJS-$(CONFIG_MICRODVD_MUXER)            += microdvdenc.o
@@ -162,10 +162,10 @@ index 466f5d1..c13c677 100644
  OBJS-$(CONFIG_MJPEG_DEMUXER)             += rawdec.o
  OBJS-$(CONFIG_MJPEG_MUXER)               += rawenc.o
 diff --git a/libavformat/allformats.c b/libavformat/allformats.c
-index e121c74..f55c75a 100644
+index 5795b65..60d2e24 100644
 --- a/libavformat/allformats.c
 +++ b/libavformat/allformats.c
-@@ -277,6 +277,8 @@ extern const FFOutputFormat ff_matroska_audio_muxer;
+@@ -282,6 +282,8 @@ extern const FFOutputFormat ff_matroska_audio_muxer;
  extern const FFInputFormat  ff_mgsts_demuxer;
  extern const FFInputFormat  ff_microdvd_demuxer;
  extern const FFOutputFormat ff_microdvd_muxer;

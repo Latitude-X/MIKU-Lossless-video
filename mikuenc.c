@@ -106,7 +106,41 @@
 //     reply for the benchmark); it's a completely separate axis from the
 //     worker-pool threading in this file -- one parallelizes the search
 //     *within* a single image, the other parallelizes *across* images.
+//
+//   - LONG-TERM REFERENCES (-delta_refs). A delta frame no longer has to be
+//     a delta against the previous frame: it may instead be a delta against
+//     any KEYFRAME the encoder still remembers -- a bounded pool of the most
+//     useful recent keyframes, kept as raw pixels in RAM. That is what makes
+//     a returning scene (A..A B..B A..A) cheap: the second A reconstructs
+//     against the first A's keyframe instead of costing a fresh keyframe. It
+//     also replaces the forced keyframe every 100 frames: when a chain hits
+//     its length cap, the next frame becomes a new chain root as a delta
+//     against a remembered keyframe, and a full keyframe is only paid for
+//     when that genuinely wouldn't be smaller.
+//
+//     Why only keyframes (never another delta) can be referenced: a keyframe
+//     is a standalone image, so the demuxer/decoder can always fetch and
+//     decode it on demand from anywhere in the file, and a seek never has to
+//     walk an arbitrary dependency graph -- the worst case is still "one
+//     chain of at most 100 frames plus one keyframe". A frame coded against
+//     a long-term reference is a chain root, just like a keyframe.
+//
+//     Direction: references here always point backwards (to a keyframe that
+//     was already encoded) because this is a single-pass streaming encoder
+//     and cannot know the future. The container, demuxer and decoder do not
+//     care -- a reference to a later keyframe is equally valid there.
+//
+//     Cost control: finding a reference must not slow the (single-threaded)
+//     producer step. Each frame is summarised by a fixed set of ~2048 sample
+//     pixels; ranking every pooled keyframe is then a few thousand compares,
+//     and a full-frame diff is run only against the single best candidate,
+//     and only when the previous-frame delta is not already clearly good (or
+//     the chain is at its cap). Decisions depend only on frame content and
+//     the options, never on timing or thread count, so output is still
+//     byte-identical across runs and -threads values.
 
+#include <inttypes.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -116,11 +150,13 @@
 #include "codec_internal.h"
 #include "encode.h"
 #include "libavutil/opt.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/internal.h"
 #include "libavutil/cpu.h"
 #include "libavutil/thread.h"
+#include "libavutil/time.h"
 #include "pthread_internal.h"
 
 // One extra slot beyond the worker count, same rationale as
@@ -147,6 +183,10 @@ typedef struct MikuTask {
     uint8_t *pixels;
     int is_keyframe; // decided by the sequential producer step, before
                       // dispatch -- workers never compute this themselves
+    int64_t frame_no;   // submission-order index; keys this task's stats record
+    int64_t nonzero;    // non-zero residual bytes (delta tasks only), for auto-tuning
+    int64_t ref_frame_no; // >= 0: this delta is against that long-term reference
+                          // keyframe (its frame number); -1: previous frame / keyframe
     int64_t pts;
     int64_t duration; // carried through explicitly: AV_CODEC_CAP_DELAY
                        // (see the FFCodec struct below) means the generic
@@ -164,6 +204,51 @@ typedef struct MikuTask {
 
     int finished; // guarded by finished_task_mutex
 } MikuTask;
+
+// Per-frame outcome, written at retrieval (main thread) and consumed
+// MIKU_AUTO_LAG-or-more frames later by the delta auto-tuner. See
+// miku_auto_apply / miku_auto_wants_delta.
+typedef struct MikuStatRec {
+    int valid;
+    int is_key;
+    int64_t size;    // compressed packet bytes
+    int64_t nonzero; // residual non-zero bytes (delta frames)
+} MikuStatRec;
+
+// Minimum number of frames between a frame's submission and the moment its
+// result is allowed to influence a decision. The actual lag is
+// max(this, ntasks): a fixed lag, independent of timing and (for thread
+// counts below this - 2) of -threads, is what keeps output deterministic --
+// see the auto-tuning comment on MikuEncContext. Must exceed the max number
+// of in-flight tasks so the record being consumed has always been retrieved.
+#define MIKU_AUTO_LAG 24
+// If no delta has been chosen for this many frames, force one probe (when
+// the frame is at least plausibly similar to its predecessor) so the
+// tuner keeps getting fresh delta-cost samples instead of locking out.
+#define MIKU_AUTO_PROBE_INTERVAL 64
+#define MIKU_AUTO_PROBE_MIN_ZERO 0.10
+#define MIKU_AUTO_EMA_ALPHA 0.125
+
+// ---- long-term reference search tuning ----
+// Sample pixels per frame used to rank pooled keyframes. The standard error
+// of the estimated unchanged-fraction is ~1% at this size.
+#define MIKU_LT_SAMPLES 2048
+// If the previous-frame delta already leaves at least this fraction of bytes
+// unchanged there is nothing a reference could add; skip the search (unless
+// the chain is at its cap and a new root is mandatory).
+#define MIKU_LT_SKIP_ZERO 0.95
+// A pooled keyframe must look at least this much better than the previous
+// frame (estimated, fraction of unchanged bytes) to be worth an exact diff.
+// Several standard errors of the estimate, so noise alone can't trigger it.
+#define MIKU_LT_MARGIN_EST 0.04
+
+// A keyframe remembered as raw pixels so later frames can be coded against it.
+typedef struct MikuLTRef {
+    uint8_t  *pixels;    // raw BGRA of a frame that was coded as a keyframe
+    uint32_t *sig;       // its sample vector (MIKU_LT_SAMPLES-or-fewer pixels)
+    int64_t   frame_no;  // that frame's number == its index entry in the file
+    int64_t   last_used; // frame number that last chose it (or its own, if never)
+} MikuLTRef;
 
 typedef struct MikuEncContext {
     AVClass *class;
@@ -226,6 +311,49 @@ typedef struct MikuEncContext {
                           // block's keyframe; block ends (forcing a fresh
                           // keyframe) at 100 regardless of how favorable
                           // deltas remain, per spec
+
+    // ---- Delta auto-tuning (-delta_auto, default on) ----
+    //
+    // Replaces the fixed delta_threshold guess with a cost model learned
+    // from the encoder's own output, at ~zero extra cost: no extra
+    // WebPEncode calls, no extra pixel passes (zero_count is already
+    // computed for the old heuristic). Per frame the decision is:
+    //     predicted_delta_bytes = (EMA delta bytes / EMA delta nonzero) * nonzero
+    //     delta iff predicted_delta_bytes <= EMA keyframe bytes * delta_margin
+    // where both EMAs come from real packets of the current stream.
+    //
+    // DETERMINISM: results arrive from workers in timing-dependent order,
+    // so feeding them to the tuner "as they arrive" would make output
+    // differ run to run. Instead each result is stored in `hist` keyed by
+    // frame number, and the tuner consumes frame N-lag's record only when
+    // preparing frame N, with lag fixed (max(MIKU_AUTO_LAG, ntasks)). Since
+    // the queue never holds more than nthreads+1 tasks, that record has
+    // always been retrieved by then, so decisions depend only on frame
+    // content and settings -- byte-identical output across runs and across
+    // -threads values (up to MIKU_AUTO_LAG-2 threads).
+    int delta_auto;
+    double delta_margin; // delta must be predicted at most this fraction of a keyframe
+    MikuStatRec *hist;
+    unsigned hist_size;
+    unsigned lag;
+    int64_t frame_no;           // frames prepared so far
+    int64_t last_delta_chosen;  // frame_no of the most recent delta decision
+    double k_size; int have_k;  // EMA of keyframe packet bytes
+    double d_size, d_nz; int have_d; // EMAs of delta packet bytes / its nonzero bytes
+    int64_t n_key, n_delta, n_probe; // for the verbose summary at close()
+
+    // ---- Long-term references (-delta_refs); see the header comment ----
+    int lt_max;          // -delta_refs: most keyframes to remember (0 = feature off)
+    int lt_mem_mb;       // -delta_ref_mem: memory budget for the remembered pixels
+    int lt_cap;          // effective pool capacity after the budget; 0 = disabled
+    MikuLTRef *lt;       // pool, lt_cap slots, filled in order then LRU-replaced
+    int lt_n;            // slots in use
+    int lt_nsamp;        // sample pixels per frame
+    uint32_t *lt_pos;    // the fixed sample positions (pixel indices)
+    uint32_t *cur_sig;   // current frame's sample vector
+    uint8_t *delta_buf2; // residual of the current frame against the best pooled keyframe
+    int64_t n_lt, n_lt_root; // frames coded against a pooled keyframe / of those, chain re-roots
+    int64_t t_prod_us, t_lt_us; // diagnostics (verbose log): time in the producer step / in its long-term part
 
     // ---- Worker pool ----
     int nthreads;
@@ -399,6 +527,40 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
             s->ref_frame_size = s->delta_buf_size = needed;
         }
 
+        if (s->delta_frames && s->lt_max > 0) {
+            int64_t total_px = (int64_t)avctx->width * avctx->height;
+            int64_t per      = needed + (int64_t)MIKU_LT_SAMPLES * 4;
+            int64_t fit      = (((int64_t)s->lt_mem_mb) << 20) / per;
+
+            s->lt_cap = (int)FFMIN((int64_t)s->lt_max, FFMIN(fit, (int64_t)INT_MAX));
+            if (s->lt_cap <= 0) {
+                s->lt_cap = 0;
+                av_log(avctx, AV_LOG_WARNING,
+                       "-delta_ref_mem %d MB can't hold even one %dx%d frame; "
+                       "long-term references disabled\n",
+                       s->lt_mem_mb, avctx->width, avctx->height);
+            } else {
+                uint32_t state = 0x9E3779B9u;
+
+                s->lt_nsamp   = (int)FFMIN((int64_t)MIKU_LT_SAMPLES, total_px);
+                s->lt         = av_calloc(s->lt_cap, sizeof(*s->lt));
+                s->lt_pos     = av_malloc_array(s->lt_nsamp, sizeof(*s->lt_pos));
+                s->cur_sig    = av_malloc_array(s->lt_nsamp, sizeof(*s->cur_sig));
+                s->delta_buf2 = av_malloc(needed);
+                if (!s->lt || !s->lt_pos || !s->cur_sig || !s->delta_buf2)
+                    return AVERROR(ENOMEM);
+                // One sample per equal-sized stratum of the frame, jittered by
+                // a fixed LCG: even coverage, and no alignment with regular
+                // patterns (dither, scanlines) that a plain grid could alias.
+                for (int i = 0; i < s->lt_nsamp; i++) {
+                    uint64_t lo = (uint64_t)total_px * i / s->lt_nsamp;
+                    uint64_t hi = (uint64_t)total_px * (i + 1) / s->lt_nsamp;
+                    state = state * 1664525u + 1013904223u;
+                    s->lt_pos[i] = (uint32_t)(lo + state % (hi - lo));
+                }
+            }
+        }
+
         // avctx->thread_count is 0 here on a completely ordinary run: the
         // ffmpeg CLI explicitly sets "auto" (fftools/ffmpeg_enc.c) unless
         // the user passes -threads themselves, and libavcodec's own
@@ -447,6 +609,17 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
         }
         s->ntasks   = s->nthreads + MIKU_TASK_SLACK;
 
+        if (s->delta_frames && s->delta_auto) {
+            // lag >= ntasks > max in-flight tasks, so frame N-lag is always
+            // retrieved before frame N is prepared. hist_size = lag + 1
+            // keeps a record from being overwritten before it's consumed.
+            s->lag       = s->ntasks > MIKU_AUTO_LAG ? s->ntasks : MIKU_AUTO_LAG;
+            s->hist_size = s->lag + 1;
+            s->hist      = av_calloc(s->hist_size, sizeof(*s->hist));
+            if (!s->hist)
+                return AVERROR(ENOMEM);
+        }
+
         s->tasks = av_calloc(s->ntasks, sizeof(*s->tasks));
         s->workers = av_calloc(s->nthreads, sizeof(*s->workers));
         if (!s->tasks || !s->workers)
@@ -479,6 +652,155 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
     return 0;
 }
 
+static void miku_ema(double *x, int *have, double v)
+{
+    if (!*have) { *x = v; *have = 1; }
+    else        *x += (v - *x) * MIKU_AUTO_EMA_ALPHA;
+}
+
+// Consumes the stats record of frame (frame_no - lag), if there is one.
+// Called once per frame from miku_prepare_task, before the decision.
+static void miku_auto_apply(MikuEncContext *s)
+{
+    MikuStatRec *r;
+    if (s->frame_no < (int64_t)s->lag)
+        return;
+    r = &s->hist[(s->frame_no - s->lag) % s->hist_size];
+    if (!r->valid)
+        return;
+    if (r->is_key) {
+        miku_ema(&s->k_size, &s->have_k, (double)r->size);
+    } else {
+        int one = s->have_d;
+        miku_ema(&s->d_size, &s->have_d, (double)r->size);
+        miku_ema(&s->d_nz,   &one,       (double)r->nonzero);
+    }
+    r->valid = 0;
+}
+
+// The decision itself. zero_frac is the fraction of unchanged bytes vs the
+// previous frame (already computed by the caller); nonzero is its
+// complement in bytes. Returns 1 to encode as a delta.
+static int miku_auto_wants_delta(MikuEncContext *s, double zero_frac, int64_t nonzero)
+{
+    // Warm-up: until both a keyframe and a delta have actually been
+    // encoded and fed back (i.e. for roughly the first `lag` frames),
+    // fall back to the old fixed-threshold rule.
+    if (!s->have_k || !s->have_d)
+        return zero_frac >= s->delta_threshold;
+
+    {
+        double bytes_per_nz = s->d_size / (s->d_nz > 1.0 ? s->d_nz : 1.0);
+        double predicted    = bytes_per_nz * (double)nonzero;
+        if (predicted <= s->k_size * s->delta_margin)
+            return 1;
+    }
+
+    // Keep the delta-cost estimate fresh: if the model hasn't picked a
+    // delta in a while, probe one on a plausibly-similar frame. Cost is one
+    // cheap (delta_method) encode per MIKU_AUTO_PROBE_INTERVAL frames.
+    if (s->frame_no - s->last_delta_chosen >= MIKU_AUTO_PROBE_INTERVAL &&
+        zero_frac >= MIKU_AUTO_PROBE_MIN_ZERO) {
+        s->n_probe++;
+        return 1;
+    }
+    return 0;
+}
+
+// ---- long-term reference pool -------------------------------------------
+
+// Fills the current frame's sample vector: the fixed sample pixels, packed.
+static void miku_lt_sample(const MikuEncContext *s, const uint8_t *px, uint32_t *sig)
+{
+    for (int i = 0; i < s->lt_nsamp; i++)
+        sig[i] = AV_RN32A(px + 4 * (int64_t)s->lt_pos[i]);
+}
+
+// Number of byte positions that are equal between two sample vectors -- the
+// sampled counterpart of "zero residual bytes", i.e. of the exact statistic
+// the full-frame diff pass computes.
+static int64_t miku_lt_equal_bytes(const uint32_t *a, const uint32_t *b, int n)
+{
+    int64_t z = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t x = a[i] ^ b[i];
+        // high bit of each byte of y is set iff that byte of x is zero
+        uint32_t y = ~(((x & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | x | 0x7F7F7F7Fu);
+        z += av_popcount(y);
+    }
+    return z;
+}
+
+// Ranks every pooled keyframe against the current frame by sampled equality
+// and returns the best slot (ties go to the most recent keyframe), or -1 if
+// the pool is empty. *est is its estimated fraction of unchanged bytes.
+static int miku_lt_best(const MikuEncContext *s, double *est)
+{
+    int best = -1;
+    int64_t best_z = -1;
+
+    for (int i = 0; i < s->lt_n; i++) {
+        int64_t z = miku_lt_equal_bytes(s->cur_sig, s->lt[i].sig, s->lt_nsamp);
+        if (z > best_z || (z == best_z && s->lt[i].frame_no > s->lt[best].frame_no)) {
+            best   = i;
+            best_z = z;
+        }
+    }
+    if (best >= 0)
+        *est = (double)best_z / (4.0 * (double)s->lt_nsamp);
+    return best;
+}
+
+// Remembers `pixels` (a frame that is being coded as a keyframe) as a
+// long-term reference. When the pool is full the least recently used slot is
+// replaced; ties go to the older keyframe. Slot buffers are allocated on first
+// use and then reused, so a stream that never fills the pool never pays for
+// the whole budget. Failure just means "not remembered" -- never an error.
+static void miku_lt_insert(MikuEncContext *s, const uint8_t *pixels, int64_t needed,
+                           int64_t frame_no)
+{
+    MikuLTRef *r;
+
+    if (s->lt_n < s->lt_cap) {
+        r = &s->lt[s->lt_n];
+        if (!r->pixels) {
+            r->pixels = av_malloc(needed);
+            r->sig    = av_malloc_array(s->lt_nsamp, sizeof(*r->sig));
+            if (!r->pixels || !r->sig) {
+                av_freep(&r->pixels);
+                av_freep(&r->sig);
+                return;
+            }
+        }
+        s->lt_n++;
+    } else {
+        int victim = 0;
+        for (int i = 1; i < s->lt_n; i++) {
+            if (s->lt[i].last_used < s->lt[victim].last_used ||
+                (s->lt[i].last_used == s->lt[victim].last_used &&
+                 s->lt[i].frame_no < s->lt[victim].frame_no))
+                victim = i;
+        }
+        r = &s->lt[victim];
+    }
+    memcpy(r->pixels, pixels, needed);
+    memcpy(r->sig, s->cur_sig, (size_t)s->lt_nsamp * sizeof(*r->sig));
+    r->frame_no  = frame_no;
+    r->last_used = frame_no;
+}
+
+// out = a - b (mod 256) over `needed` bytes; returns how many result bytes are
+// zero. The same loop the previous-frame diff has always used.
+static int64_t miku_diff(uint8_t *out, const uint8_t *a, const uint8_t *b, int64_t needed)
+{
+    int64_t zero = 0;
+    for (int64_t i = 0; i < needed; i++) {
+        out[i] = (uint8_t)(a[i] - b[i]); // mod 256: plain uint8_t wraparound
+        if (!out[i]) zero++;
+    }
+    return zero;
+}
+
 // Runs the sequential producer step (delta computation, adaptive heuristic,
 // block-cap, reference update) for the current frame and fills task slot
 // `s->task_index` with whichever buffer (raw or delta) the heuristic
@@ -488,30 +810,81 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
 // itself) -- the caller does that once this returns, matching
 // frame_thread_encoder.c's own split between filling a slot and
 // publishing it.
+//
+// Each frame ends up as exactly one of:
+//   keyframe            standalone image (also seeds the long-term pool)
+//   delta vs previous   the classic chain link
+//   delta vs pooled key a chain ROOT: needs only that keyframe, nothing before
 static int miku_prepare_task(AVCodecContext *avctx, const AVFrame *frame)
 {
     MikuEncContext *s = avctx->priv_data;
     int stride = avctx->width * 4;
     int64_t needed = (int64_t)stride * avctx->height;
     int encode_as_delta = 0;
+    int lt_choice = -1;      // pool slot when coded against a long-term reference
+    int chain_ok = 1;        // may this frame be a plain delta vs the previous one?
     MikuTask *task = &s->tasks[s->task_index];
+    int64_t t_start = av_gettime_relative(), t_mark;
+    int sig_ready;           // has cur_sig been filled for this frame yet?
 
     av_image_copy_plane(s->scratch, stride, frame->data[0], frame->linesize[0],
                          stride, avctx->height);
 
-    if (s->delta_frames && s->have_reference) {
-        const uint8_t *curr = s->scratch;
-        const uint8_t *ref  = s->ref_frame;
-        uint8_t *delta      = s->delta_buf;
-        int64_t zero_count  = 0;
+    // Must run exactly once per frame, unconditionally: records are keyed
+    // by frame number, so a skipped call would silently drop that frame's
+    // stats rather than deferring them.
+    if (s->delta_frames && s->delta_auto)
+        miku_auto_apply(s);
+    task->nonzero      = 0;
+    task->ref_frame_no = -1;
 
-        for (int64_t i = 0; i < needed; i++) {
-            delta[i] = (uint8_t)(curr[i] - ref[i]); // mod 256: plain uint8_t wraparound
-            if (!delta[i]) zero_count++;
+    // The sample vector is only needed to search the pool or to remember this
+    // frame in it, and the sampling itself (thousands of scattered reads, one
+    // cache line and TLB entry each) is not free -- so it is taken on first
+    // use. In the common case of a long run of small deltas neither happens,
+    // and long-term references cost this frame nothing.
+    sig_ready = 0;
+
+    if (s->delta_frames && s->have_reference) {
+        int64_t zero_count = miku_diff(s->delta_buf, s->scratch, s->ref_frame, needed);
+        int64_t cand_nz    = needed - zero_count;   // changed bytes of the chosen delta
+        double  zp         = (double)zero_count / (double)needed;
+
+        chain_ok = s->frames_in_block < 100;
+
+        // Long-term candidate: only worth looking for when the previous-frame
+        // delta isn't already clearly good, or when the chain is at its cap and
+        // a new root is mandatory (then it is the alternative to a keyframe).
+        if (s->lt_n > 0 && (!chain_ok || zp < MIKU_LT_SKIP_ZERO)) {
+            double est = 0.0;
+            int b;
+            t_mark = av_gettime_relative();
+            miku_lt_sample(s, s->scratch, s->cur_sig);
+            sig_ready = 1;
+            b = miku_lt_best(s, &est);
+            if (b >= 0 && (!chain_ok || est > zp + MIKU_LT_MARGIN_EST)) {
+                int64_t zl   = miku_diff(s->delta_buf2, s->scratch, s->lt[b].pixels, needed);
+                int64_t nz_l = needed - zl;
+                // Take it if the chain forces a root, or if it changes at
+                // least 10% fewer bytes than the previous-frame delta.
+                if (!chain_ok || nz_l * 10 < cand_nz * 9) {
+                    lt_choice = b;
+                    cand_nz   = nz_l;
+                }
+            }
+            s->t_lt_us += av_gettime_relative() - t_mark;
         }
 
-        encode_as_delta = (s->frames_in_block < 100) &&
-            ((double)zero_count / (double)needed >= s->delta_threshold);
+        if (chain_ok || lt_choice >= 0) {
+            double zf = 1.0 - (double)cand_nz / (double)needed;
+            if (s->delta_auto)
+                encode_as_delta = miku_auto_wants_delta(s, zf, cand_nz);
+            else
+                encode_as_delta = zf >= s->delta_threshold;
+        }
+        if (!encode_as_delta)
+            lt_choice = -1;     // a keyframe beat both kinds of delta
+        task->nonzero = cand_nz;
     }
 
     if (s->delta_frames) {
@@ -519,14 +892,37 @@ static int miku_prepare_task(AVCodecContext *avctx, const AVFrame *frame)
         s->have_reference = 1;
     }
 
-    if (encode_as_delta) {
+    if (lt_choice >= 0) {
+        memcpy(task->pixels, s->delta_buf2, needed);
+        s->frames_in_block = 1; // a chain root, like a keyframe
+        task->ref_frame_no = s->lt[lt_choice].frame_no;
+        s->lt[lt_choice].last_used = s->frame_no;
+        s->n_lt++;
+        if (!chain_ok)
+            s->n_lt_root++;
+    } else if (encode_as_delta) {
         memcpy(task->pixels, s->delta_buf, needed);
         s->frames_in_block++;
     } else {
         memcpy(task->pixels, s->scratch, needed);
         s->frames_in_block = 1;
+        if (s->lt_cap) {
+            t_mark = av_gettime_relative();
+            if (!sig_ready)
+                miku_lt_sample(s, s->scratch, s->cur_sig);
+            miku_lt_insert(s, s->scratch, needed, s->frame_no);
+            s->t_lt_us += av_gettime_relative() - t_mark;
+        }
     }
     task->is_keyframe = !encode_as_delta;
+    task->frame_no    = s->frame_no;
+    if (encode_as_delta) {
+        s->last_delta_chosen = s->frame_no;
+        s->n_delta++;
+    } else {
+        s->n_key++;
+    }
+    s->frame_no++;
     task->pts         = frame->pts;
     task->duration    = frame->duration;
     task->finished     = 0;
@@ -534,6 +930,7 @@ static int miku_prepare_task(AVCodecContext *avctx, const AVFrame *frame)
     task->out_size     = 0;
     task->encode_failed = 0;
 
+    s->t_prod_us += av_gettime_relative() - t_start;
     return 0;
 }
 
@@ -589,6 +986,16 @@ static int miku_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return AVERROR_EXTERNAL;
     }
 
+    if (s->hist) {
+        // Record this frame's real outcome for the auto-tuner; consumed
+        // `lag` frames later (see MikuEncContext) so timing never leaks in.
+        MikuStatRec *r = &s->hist[outtask->frame_no % s->hist_size];
+        r->is_key  = outtask->is_keyframe;
+        r->size    = (int64_t)outtask->out_size;
+        r->nonzero = outtask->nonzero;
+        r->valid   = 1;
+    }
+
     ret = av_new_packet(pkt, outtask->out_size);
     if (ret < 0) {
         WebPMemoryWriter tmp = { .mem = outtask->out_data, .size = outtask->out_size,
@@ -623,12 +1030,20 @@ static int miku_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         // which makes libavcodec/encode.c's generic pipeline force that flag
         // onto every packet this encoder produces regardless of what's set
         // here. See AV_PKT_DATA_MIKU_IS_DELTA's comment in packet.h.
-        if (!av_packet_new_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, 1)) {
+        // Payload: 1 byte (0) = delta against the previous frame; 8 bytes =
+        // little-endian frame number of the long-term reference keyframe.
+        size_t sd_size = outtask->ref_frame_no >= 0 ? 8 : 1;
+        uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, sd_size);
+        if (!sd) {
             av_log(avctx, AV_LOG_ERROR, "Failed to attach delta-frame side data\n");
             outtask->finished = 0;
             s->finished_task_index = (s->finished_task_index + 1) % s->ntasks;
             return AVERROR(ENOMEM);
         }
+        if (sd_size == 8)
+            AV_WL64(sd, (uint64_t)outtask->ref_frame_no);
+        else
+            sd[0] = 0;
     }
 
     outtask->finished = 0;
@@ -640,6 +1055,26 @@ static int miku_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 static av_cold int miku_encode_close(AVCodecContext *avctx)
 {
     MikuEncContext *s = avctx->priv_data;
+
+    if (s->delta_frames && s->lt_cap && s->frame_no > 0)
+        av_log(avctx, AV_LOG_VERBOSE,
+               "long-term refs: %"PRId64" frames coded against a remembered keyframe "
+               "(%"PRId64" of them re-rooting a full chain instead of a keyframe); "
+               "pool %d/%d keyframes\n", s->n_lt, s->n_lt_root, s->lt_n, s->lt_cap);
+
+    if (s->delta_frames && s->frame_no > 0)
+        av_log(avctx, AV_LOG_VERBOSE,
+               "producer step (the one sequential part): %.2f ms/frame, of which long-term "
+               "reference work %.3f ms/frame\n",
+               (double)s->t_prod_us / 1000.0 / (double)s->frame_no,
+               (double)s->t_lt_us   / 1000.0 / (double)s->frame_no);
+
+    if (s->delta_frames && s->delta_auto && s->frame_no > 0)
+        av_log(avctx, AV_LOG_VERBOSE,
+               "delta auto-tune: %"PRId64" keyframes, %"PRId64" delta frames "
+               "(%"PRId64" probes); est. keyframe %.0f B, delta %.3f B per "
+               "non-zero byte\n", s->n_key, s->n_delta, s->n_probe, s->k_size,
+               s->d_nz > 1.0 ? s->d_size / s->d_nz : 0.0);
 
     atomic_store(&s->exit, 1);
     if (s->workers) {
@@ -667,6 +1102,17 @@ static av_cold int miku_encode_close(AVCodecContext *avctx)
     av_freep(&s->scratch);
     av_freep(&s->ref_frame);
     av_freep(&s->delta_buf);
+    av_freep(&s->hist);
+    if (s->lt) {
+        for (int i = 0; i < s->lt_cap; i++) {
+            av_freep(&s->lt[i].pixels);
+            av_freep(&s->lt[i].sig);
+        }
+    }
+    av_freep(&s->lt);
+    av_freep(&s->lt_pos);
+    av_freep(&s->cur_sig);
+    av_freep(&s->delta_buf2);
     return 0;
 }
 
@@ -697,9 +1143,33 @@ static const AVOption miku_options[] = {
       "independent regardless of content.",
       OFFSET(delta_frames), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { "delta_threshold", "Fraction of unchanged bytes (0..1) above which a candidate "
-      "frame is encoded as a delta rather than ending the block early. NOT YET "
-      "empirically tuned against real footage -- see the reply",
+      "frame is encoded as a delta rather than ending the block early. With "
+      "-delta_auto 1 (default) this is only the warm-up rule used for the first "
+      "~24 frames, before the tuner has real size feedback; with -delta_auto 0 it "
+      "is the permanent rule",
       OFFSET(delta_threshold), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0.0, 1.0, VE },
+    { "delta_auto", "Choose delta vs keyframe per frame from a cost model learned "
+      "from this stream's own compressed packet sizes (no extra encodes, "
+      "deterministic across runs and -threads), instead of the fixed "
+      "-delta_threshold. Only meaningful with -delta_frames 1",
+      OFFSET(delta_auto), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    { "delta_margin", "With -delta_auto: encode as delta only if its predicted size "
+      "is at most this fraction of the estimated keyframe size. Below 1 biases "
+      "toward keyframes, trading some file size for cheaper seeking/decoding "
+      "(no dependency chain)",
+      OFFSET(delta_margin), AV_OPT_TYPE_DOUBLE, { .dbl = 0.85 }, 0.1, 2.0, VE },
+    { "delta_refs", "Long-term references: let a delta frame reconstruct against any of "
+      "up to this many remembered earlier KEYFRAMES, not only the previous frame. Makes "
+      "a returning scene (A B A) cheap, and replaces the forced keyframe every 100 frames "
+      "with a delta against a remembered keyframe whenever that is smaller. Each remembered "
+      "keyframe costs one raw frame of RAM (see -delta_ref_mem). 0 turns the feature off; "
+      "output is then exactly the older format, readable by older demuxers. Files that "
+      "actually use a long-term reference are written as format v3 (the muxer decides)",
+      OFFSET(lt_max), AV_OPT_TYPE_INT, { .i64 = 32 }, 0, 4096, VE },
+    { "delta_ref_mem", "Memory budget in MB for the raw keyframes remembered as long-term "
+      "references; the pool holds at most min(-delta_refs, this budget / frame size) "
+      "keyframes. Memory is only committed as keyframes are actually remembered",
+      OFFSET(lt_mem_mb), AV_OPT_TYPE_INT, { .i64 = 256 }, 1, 16384, VE },
     { "delta_method", "Compression method (effort level) used for delta-residual frames "
       "only; keyframes always use -method. Lower than -method by default: bounds a "
       "delta candidate's worst-case encode time when delta_threshold's whole-frame "

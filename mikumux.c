@@ -16,7 +16,10 @@
 //   [64, X)   META block: "META" magic, flags u8, json_len u32, json data,
 //             optional thumbnail bytes (present iff flags & MIKU_META_FLAG_THUMBNAIL)
 //   [X, Y)    video frame bytes, back to back, one contiguous WebP image
-//             per frame (deduplicated -- see miku_write_video_packet)
+//             per frame. DEDUPLICATED GLOBALLY: a packet whose bytes are
+//             identical to ANY earlier packet in the file (not just the
+//             previous one) is not written again -- its index entry just
+//             points at the first copy. See miku_write_video_packet.
 //   [Y, Z)    audio blob: a complete embedded FLAC stream ("fLaC" + a single
 //             STREAMINFO metadata block + raw FLAC frames)
 //   [Z, end)  index table: n_frames entries of {offset u64, size u32,
@@ -28,6 +31,20 @@
 //             AV_PKT_FLAG_KEY at encode time); the real size is the low 31
 //             bits. Off by default -- with delta mode inactive the size
 //             field is the plain, full-range byte count exactly as before.
+//
+//             LONG-TERM REFERENCES (format v3, codec_flag 0x03). A delta frame
+//             normally reconstructs against the previous frame. With long-term
+//             references it may instead reconstruct against ANY keyframe in
+//             the file -- earlier or later, since a keyframe is a standalone
+//             image and so can always be decoded on demand. Only if at least
+//             one frame actually uses this does the muxer write v3: it patches
+//             the header version/codec_flag in write_trailer and widens every
+//             index entry (including the trailing audio entry) to 24 bytes:
+//                 {offset u64, size u32, duration u32, ref i32, reserved u32}
+//             ref is the index of the reference keyframe, or -1 for none (a
+//             keyframe, or an ordinary delta against the previous frame). A
+//             file that never uses a long-term reference is still written as
+//             plain v2 (16-byte entries), so older readers keep opening it.
 //
 // Header field byte offsets (64 bytes total):
 //   0   "MIKU" magic (4 bytes)
@@ -53,6 +70,7 @@
 // thumbnail data). It must be WebP, same as the primary video stream.
 // ---------------------------------------------------------------------
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "avformat.h"
@@ -63,6 +81,7 @@
 #include "libavcodec/packet.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
+#include "libavutil/hash.h"
 #include "libavutil/mem.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
@@ -98,14 +117,53 @@
                                        // always produced -- this only ever appears when
                                        // delta mode was explicitly requested.
 
+#define MIKU_CODEC_WEBP_DELTA_REFS 0x03 // delta mode + at least one long-term reference
+                                         // (24-byte index entries); old readers reject
+                                         // this value outright instead of misdecoding.
+#define MIKU_FORMAT_VERSION_REFS   3
+
 #define MIKU_META_FLAG_THUMBNAIL 0x02
 #define MIKU_META_FLAG_COLOR     0x04
+
+#define MIKU_KEYFRAME_BIT        0x80000000u // delta mode: MSB of an index entry's size
+
+// -dedup modes
+#define MIKU_DEDUP_OFF     0
+#define MIKU_DEDUP_LAST    1 // only against the immediately preceding frame
+#define MIKU_DEDUP_GLOBAL  2 // against every earlier frame in the file
 
 typedef struct MikuIndexEntry {
     int64_t  offset;
     uint32_t size;
     uint32_t duration;
+    int32_t  ref;       // long-term reference keyframe's index, or -1
 } MikuIndexEntry;
+
+// One slot of a content table: a 128-bit content digest plus the exact byte
+// size, mapped to a value. Two tables use this shape:
+//   dedup_t -- every unique packet written -> file offset of its first copy
+//   kf_t    -- every keyframe written       -> index of the first frame holding it
+typedef struct MikuDedupSlot {
+    uint8_t  digest[16];
+    int64_t  value;
+    uint32_t size;
+    uint32_t used;
+} MikuDedupSlot;
+
+typedef struct MikuTable {
+    MikuDedupSlot *slots; // open addressing, power-of-two capacity, <= half full
+    uint32_t       cap;
+    uint32_t       n;
+} MikuTable;
+
+// A stream-copied reference whose keyframe had not been written yet when the
+// referencing packet arrived (a forward reference). Resolved by content in
+// write_trailer, once every keyframe of the output is known.
+typedef struct MikuPendingRef {
+    int32_t  frame;     // index of the referencing frame
+    uint32_t size;      // size of the referenced keyframe's bytes
+    uint8_t  digest[16];
+} MikuPendingRef;
 
 typedef struct MikuMuxContext {
     const AVClass *class; // must be first: required by the AVOptions machinery
@@ -135,12 +193,42 @@ typedef struct MikuMuxContext {
     MikuIndexEntry *index;
     int index_len, index_cap;
 
-    // Dedup state (item 3): bytes of the last physically-written, non-duplicate
-    // frame, so each new frame only needs a size check + memcmp against this.
+    // Dedup state. Fast path (exact, byte-compared): bytes of the most
+    // recent frame, so a frame identical to its predecessor needs only a
+    // size check + memcmp -- no hashing at all. This covers runs of static
+    // or all-zero-residual frames, the common case.
     uint8_t *last_frame_data;
     int      last_frame_size;
     int      last_frame_cap;
     int64_t  last_frame_offset;
+
+    // Global dedup (-dedup global): content digest of every unique packet
+    // written so far -> where its single physical copy lives. Lets a frame
+    // that matches ANY earlier frame (a loop, a returning scene, a repeated
+    // slate) reuse that copy. The digest is 128-bit murmur3 plus the exact
+    // byte size; there is no byte-for-byte verification against the old copy
+    // (the muxer cannot read back what it has written), so correctness rests
+    // on the digest -- an accidental collision between two distinct packets
+    // has probability ~2^-128 per pair. Memory: 32 bytes per unique frame.
+    int dedup;                    // -dedup option, one of MIKU_DEDUP_*
+    struct AVHashContext *hash;   // murmur3, allocated in init() for global dedup / delta mode
+    MikuTable      dedup_t;       // digest -> file offset of the first copy
+    int64_t        dedup_hits;    // statistics, logged at trailer time
+    int64_t        dedup_bytes_saved;
+    int            any_ref;       // 1 once any frame used a long-term reference
+
+    // Long-term references arriving from a demuxer (stream copy) are named by
+    // the SOURCE file's frame numbers, which stop meaning anything the moment
+    // the copy drops, trims or reorders frames -- and a stale number can point
+    // at some other keyframe and silently produce a corrupt file. Those
+    // packets also carry the referenced keyframe's own bytes, so the muxer
+    // resolves them by content instead: kf_t maps every keyframe written (in
+    // delta mode) to its index in THIS output, and a reference to content not
+    // seen yet (a forward reference) waits in pend until write_trailer.
+    // References from the encoder are exact output numbers and used as is.
+    MikuTable        kf_t;
+    MikuPendingRef  *pend;
+    int              pend_n, pend_cap;
 
     // Audio (item 1/6): built up in a dynamic buffer as FLAC packets arrive,
     // written to the real file as one contiguous blob in write_trailer, since
@@ -168,7 +256,7 @@ typedef struct MikuMuxContext {
 // ---- small helpers -------------------------------------------------------
 
 static int miku_index_append(MikuMuxContext *c, int64_t offset,
-                              uint32_t size, uint32_t duration)
+                              uint32_t size, uint32_t duration, int32_t ref)
 {
     if (c->index_len == c->index_cap) {
         int new_cap = c->index_cap ? c->index_cap * 2 : 1024;
@@ -181,8 +269,132 @@ static int miku_index_append(MikuMuxContext *c, int64_t offset,
     c->index[c->index_len].offset   = offset;
     c->index[c->index_len].size     = size;
     c->index[c->index_len].duration = duration;
+    c->index[c->index_len].ref      = ref;
     c->index_len++;
     return 0;
+}
+
+// ---- content tables (global dedup, keyframe map) ----------------------------
+
+static MikuDedupSlot *miku_table_probe(MikuTable *t, const uint8_t *digest,
+                                        uint32_t size)
+{
+    uint32_t mask = t->cap - 1;
+    uint32_t i    = (uint32_t)AV_RL64(digest) & mask;
+
+    // Linear probing; the table is kept at most half full, so this always
+    // terminates at an empty slot. Returns either the matching slot or the
+    // empty slot where this digest would be inserted.
+    while (t->slots[i].used) {
+        if (t->slots[i].size == size &&
+            !memcmp(t->slots[i].digest, digest, 16))
+            return &t->slots[i];
+        i = (i + 1) & mask;
+    }
+    return &t->slots[i];
+}
+
+static int miku_table_grow(MikuTable *t)
+{
+    uint32_t old_cap     = t->cap;
+    MikuDedupSlot *old   = t->slots;
+    uint32_t new_cap     = old_cap ? old_cap * 2 : 4096;
+    MikuDedupSlot *fresh = av_calloc(new_cap, sizeof(*fresh));
+
+    if (!fresh)
+        return AVERROR(ENOMEM);
+    t->slots = fresh;
+    t->cap   = new_cap;
+    for (uint32_t i = 0; i < old_cap; i++)
+        if (old[i].used)
+            *miku_table_probe(t, old[i].digest, old[i].size) = old[i];
+    av_free(old);
+    return 0;
+}
+
+// Returns the slot holding this content if it was seen before, else NULL.
+static const MikuDedupSlot *miku_table_lookup(MikuTable *t,
+                                               const uint8_t *digest, uint32_t size)
+{
+    MikuDedupSlot *slot;
+    if (!t->cap)
+        return NULL;
+    slot = miku_table_probe(t, digest, size);
+    return slot->used ? slot : NULL;
+}
+
+// First writer wins: re-inserting content that is already present keeps the
+// original value (the earliest copy / the lowest-numbered keyframe).
+static int miku_table_insert(MikuTable *t, const uint8_t *digest,
+                              uint32_t size, int64_t value)
+{
+    MikuDedupSlot *slot;
+    if ((t->n + 1) * 2 > t->cap) {
+        int ret = miku_table_grow(t);
+        if (ret < 0)
+            return ret;
+    }
+    slot = miku_table_probe(t, digest, size);
+    if (!slot->used) {
+        memcpy(slot->digest, digest, 16);
+        slot->size  = size;
+        slot->value = value;
+        slot->used  = 1;
+        t->n++;
+    }
+    return 0;
+}
+
+static void miku_table_free(MikuTable *t)
+{
+    av_freep(&t->slots);
+    t->cap = t->n = 0;
+}
+
+// 128-bit murmur3 of a byte range, via the context's shared hash.
+static void miku_digest(MikuMuxContext *c, const uint8_t *data, size_t size,
+                         uint8_t digest[16])
+{
+    av_hash_init(c->hash);
+    av_hash_update(c->hash, data, size);
+    av_hash_final_bin(c->hash, digest, 16);
+}
+
+// How a packet names its long-term reference, if it has one.
+enum {
+    MIKU_REF_NONE = 0,
+    MIKU_REF_NUMBER,    // encoder: the exact frame number in THIS output
+    MIKU_REF_CONTENT,   // demuxer (stream copy): source numbering + the keyframe's bytes
+};
+
+// Two sources. The encoder tags a delta packet with AV_PKT_DATA_MIKU_IS_DELTA
+// whose 8-byte payload is the reference keyframe's frame number -- exact,
+// because the encoder numbers frames in the order the muxer receives them. A
+// demuxer tags a packet it hands out for stream copy with
+// AV_PKT_DATA_MIKU_REF_FRAME: the SOURCE file's frame number, then the
+// keyframe's own bytes; the number is only a hint (see kf_t above), the bytes
+// are what the muxer matches on.
+static int miku_packet_ref(const AVPacket *pkt, int64_t *number,
+                            const uint8_t **kf_data, size_t *kf_size)
+{
+    size_t sz = 0;
+    const uint8_t *sd = av_packet_get_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, &sz);
+    if (sd && sz >= 8) {
+        *number = (int64_t)AV_RL64(sd);
+        return MIKU_REF_NUMBER;
+    }
+    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_MIKU_REF_FRAME, &sz);
+    if (sd && sz > 8 && sz - 8 <= INT32_MAX) {
+        *number  = (int64_t)AV_RL64(sd);
+        *kf_data = sd + 8;
+        *kf_size = sz - 8;
+        return MIKU_REF_CONTENT;
+    }
+    if (sd && sz == 8) { // number only, no bytes to match on: trust it as is
+        *number = (int64_t)AV_RL64(sd);
+        return MIKU_REF_NUMBER;
+    }
+    return MIKU_REF_NONE;
 }
 
 static void miku_write_json_string(AVIOContext *pb, const char *s)
@@ -573,6 +785,16 @@ static int miku_init(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
+    if (c->dedup == MIKU_DEDUP_GLOBAL || c->delta_mode) {
+        // 128-bit murmur3: fast (several GB/s) and non-cryptographic, which
+        // is fine -- the input is the encoder's own output, not an adversary's.
+        // Delta mode needs it even without global dedup, to match stream-
+        // copied long-term references to keyframes by content.
+        int ret = av_hash_alloc(&c->hash, "murmur3");
+        if (ret < 0)
+            return ret;
+    }
+
     c->waiting_thumb = c->thumb_stream_idx >= 0 || c->auto_thumbnail;
     return 0;
 }
@@ -590,9 +812,21 @@ static int miku_write_header(AVFormatContext *s)
     return 0;
 }
 
-// Item 3 (dedup) + item 4 (index) + item 2 (VFR durations) + item 5
-// (sequential-friendly: dedup only ever compares against the *previous*
-// frame, an O(1) check per packet, not an O(n) search across all frames).
+// Item 3 (dedup) + item 4 (index) + item 2 (VFR durations).
+//
+// Dedup is two-level. (1) Exact fast path: if this packet is byte-identical
+// to the previous one (checked with memcmp, no hashing), reuse its copy --
+// the overwhelmingly common case for static or unchanged content. (2) Global
+// path (-dedup global, the default): otherwise hash the packet and look it
+// up among every unique packet already written, so repeats that are NOT
+// adjacent (a looping animation, a scene that returns, a repeated title
+// card) are also stored once. Direction does not matter: whichever copy
+// appears first in the file is the physical one and every later identical
+// packet -- from any later frame -- points back at it.
+//
+// Dedup works purely on bytes and never changes what a frame IS: each index
+// entry carries its own keyframe bit and reference, so two frames can share
+// bytes (say, an all-zero residual) while having different roles.
 static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MikuMuxContext *c = s->priv_data;
@@ -606,14 +840,67 @@ static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
     int64_t scaled_duration = pkt->duration > 0
         ? av_rescale_q(pkt->duration, vst->time_base, c->hdr_time_base) : 0;
     uint32_t duration = scaled_duration > 0 ? (uint32_t)scaled_duration : 1;
-    int is_dup = c->last_frame_size > 0 && pkt->size > 0 &&
+
+    // What this frame IS comes first, because it also decides what has to be
+    // hashed below.
+    //
+    // Delta mode steals size's MSB for the keyframe flag rather than growing
+    // the index entry (WebP/delta payloads won't remotely approach 2GB). This
+    // only ever happens when delta_mode is set (video codec_id ==
+    // AV_CODEC_ID_MIKU_DELTA); with delta_mode off, size_field == size
+    // exactly, unchanged from before delta mode existed.
+    //
+    // The bit comes from *this* packet's own role, never from whatever frame
+    // its bytes were deduped against -- offset/size say where the bytes live,
+    // this says what frame N itself is.
+    //
+    // Encoder-origin packets: pkt->flags & AV_PKT_FLAG_KEY is useless here --
+    // verified against libavcodec/encode.c that the generic pipeline
+    // force-sets it on every packet this encoder produces (AV_CODEC_ID_WEBP's
+    // descriptor is AV_CODEC_PROP_INTRA_ONLY, decided before the encoder's own
+    // init() mutates codec_id), so it is 1 regardless of what the encoder
+    // decided. Those packets mark a delta frame with AV_PKT_DATA_MIKU_IS_DELTA
+    // side data instead. Demuxer-origin packets (stream-copy remux) are the
+    // opposite: the KEY flag is accurate and there is no IS_DELTA side data.
+    // So a frame is a delta if it has the side data OR lacks the key flag; for
+    // an encoder packet that is exactly the side data test, for a demuxer
+    // packet exactly the flag test.
+    int64_t ref_number = -1;
+    const uint8_t *ref_kf = NULL;
+    size_t ref_kf_size = 0;
+    int ref_kind = c->delta_mode ? miku_packet_ref(pkt, &ref_number, &ref_kf, &ref_kf_size)
+                                 : MIKU_REF_NONE;
+    int is_delta = c->delta_mode &&
+        (av_packet_get_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, NULL) != NULL ||
+         ref_kind != MIKU_REF_NONE || !(pkt->flags & AV_PKT_FLAG_KEY));
+
+    int is_dup = c->dedup != MIKU_DEDUP_OFF &&
+                 c->last_frame_size > 0 && pkt->size > 0 &&
                  c->last_frame_size == pkt->size &&
                  memcmp(c->last_frame_data, pkt->data, pkt->size) == 0;
+    uint8_t digest[16];
+    int have_digest = 0;
+    uint32_t size_field;
+    int32_t ref = -1;
+    int ret;
 
     if (is_dup) {
         offset = c->last_frame_offset;
         size   = (uint32_t)c->last_frame_size;
+        c->dedup_hits++;
+        c->dedup_bytes_saved += pkt->size;
     } else {
+        const MikuDedupSlot *hit = NULL;
+
+        if (c->dedup == MIKU_DEDUP_GLOBAL && pkt->size > 0 && c->hash) {
+            miku_digest(c, pkt->data, pkt->size, digest);
+            have_digest = 1;
+            hit = miku_table_lookup(&c->dedup_t, digest, (uint32_t)pkt->size);
+        }
+
+        // Whether this packet turns out new or a global repeat, remember its
+        // bytes as "the previous frame" so the next packet can try the
+        // memcmp fast path against it.
         if (pkt->size > c->last_frame_cap) {
             uint8_t *nd = av_realloc(c->last_frame_data, pkt->size);
             if (!nd)
@@ -625,40 +912,76 @@ static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
             memcpy(c->last_frame_data, pkt->data, pkt->size);
         c->last_frame_size = pkt->size;
 
-        offset = avio_tell(s->pb);
-        avio_write(s->pb, pkt->data, pkt->size);
+        if (hit) {
+            offset = hit->value;
+            size   = (uint32_t)hit->size;
+            c->dedup_hits++;
+            c->dedup_bytes_saved += pkt->size;
+        } else {
+            offset = avio_tell(s->pb);
+            avio_write(s->pb, pkt->data, pkt->size);
+            size = (uint32_t)pkt->size;
+            if (have_digest) {
+                ret = miku_table_insert(&c->dedup_t, digest, size, offset);
+                if (ret < 0)
+                    return ret;
+            }
+        }
         c->last_frame_offset = offset;
-        size = (uint32_t)pkt->size;
     }
 
-    {
-        // Delta mode (item: muxer keyframe-bit tracking): steal size's MSB
-        // for the keyframe flag rather than growing the 16-byte index entry.
-        // WebP/delta frame payloads won't remotely approach 2GB, so the top
-        // bit of a byte count is safe to repurpose. This only ever happens
-        // when delta_mode is set (video codec_id == AV_CODEC_ID_MIKU_DELTA);
-        // with delta_mode off, size_field == size exactly, unchanged from
-        // today's behavior.
-        //
-        // The bit comes from *this* packet's own delta-ness, not from
-        // whatever frame the bytes were deduped against above -- offset/size
-        // say where the bytes live, this says what frame N's own role is.
-        //
-        // Deliberately NOT pkt->flags & AV_PKT_FLAG_KEY: verified against
-        // libavcodec/encode.c that the generic pipeline force-sets that flag
-        // on every packet this encoder produces (AV_CODEC_ID_WEBP's codec
-        // descriptor is AV_CODEC_PROP_INTRA_ONLY, decided before the
-        // encoder's own init() mutates codec_id for delta mode), so it's 1
-        // regardless of what the encoder actually decided. Side data isn't
-        // touched by that mechanism -- see AV_PKT_DATA_MIKU_IS_DELTA's own
-        // comment in packet.h.
-        int is_delta = c->delta_mode &&
-            av_packet_get_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, NULL) != NULL;
-        uint32_t size_field = size;
-        if (c->delta_mode && !is_delta)
-            size_field |= 0x80000000u;
-        return miku_index_append(c, offset, size_field, duration);
+    size_field = size;
+    if (c->delta_mode && !is_delta) {
+        size_field |= MIKU_KEYFRAME_BIT;
+        // Remember which frame of the OUTPUT holds this keyframe's content,
+        // so that stream-copied references to it can be matched by content
+        // (see kf_t). Costs one hash per keyframe -- free when global dedup
+        // already computed it, and keyframes are the rare packets anyway.
+        if (pkt->size > 0 && c->hash) {
+            if (!have_digest)
+                miku_digest(c, pkt->data, pkt->size, digest);
+            ret = miku_table_insert(&c->kf_t, digest, (uint32_t)pkt->size, c->index_len);
+            if (ret < 0)
+                return ret;
+        }
     }
+
+    if (is_delta && ref_kind != MIKU_REF_NONE) {
+        c->any_ref = 1;
+        if (ref_kind == MIKU_REF_CONTENT && c->hash) {
+            uint8_t rd[16];
+            const MikuDedupSlot *k;
+
+            miku_digest(c, ref_kf, ref_kf_size, rd);
+            k = miku_table_lookup(&c->kf_t, rd, (uint32_t)ref_kf_size);
+            if (k) {
+                ref = (int32_t)k->value;
+            } else {
+                // Not written yet: a forward reference (or one whose keyframe
+                // was cut away, which write_trailer will report). Park it.
+                if (c->pend_n == c->pend_cap) {
+                    int nc = c->pend_cap ? c->pend_cap * 2 : 16;
+                    MikuPendingRef *np = av_realloc_array(c->pend, nc, sizeof(*np));
+                    if (!np)
+                        return AVERROR(ENOMEM);
+                    c->pend = np;
+                    c->pend_cap = nc;
+                }
+                c->pend[c->pend_n].frame = c->index_len;
+                c->pend[c->pend_n].size  = (uint32_t)ref_kf_size;
+                memcpy(c->pend[c->pend_n].digest, rd, 16);
+                c->pend_n++;
+                ref = -2; // placeholder, fixed up in write_trailer
+            }
+        } else {
+            if (ref_number < 0 || ref_number > INT32_MAX) {
+                av_log(s, AV_LOG_ERROR, "Invalid long-term reference %"PRId64"\n", ref_number);
+                return AVERROR(EINVAL);
+            }
+            ref = (int32_t)ref_number;
+        }
+    }
+    return miku_index_append(c, offset, size_field, duration, ref);
 }
 
 // Item 1 (accept encoded FLAC packets) + item 6 (single contiguous audio
@@ -716,6 +1039,21 @@ static int miku_write_audio_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
+// Same role test miku_write_video_packet applies: a packet is a delta frame
+// if the encoder tagged it, it names a long-term reference, or (demuxer
+// origin) it lacks the key flag.
+static int miku_packet_is_delta(const MikuMuxContext *c, const AVPacket *pkt)
+{
+    int64_t number;
+    const uint8_t *kf;
+    size_t kf_size;
+
+    return c->delta_mode &&
+        (av_packet_get_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, NULL) != NULL ||
+         miku_packet_ref(pkt, &number, &kf, &kf_size) != MIKU_REF_NONE ||
+         !(pkt->flags & AV_PKT_FLAG_KEY));
+}
+
 static int miku_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MikuMuxContext *c = s->priv_data;
@@ -740,14 +1078,20 @@ static int miku_write_packet(AVFormatContext *s, AVPacket *pkt)
     // Frame 0 is always a real, standalone keyframe (see mikuenc.c), so its
     // bytes are already valid, freestanding WebP data -- a copy, not a
     // re-encode -- and it still gets written as a completely normal frame 0
-    // afterward via the fallthrough at the end of this function.
+    // afterward via the fallthrough at the end of this function. The one
+    // exception is a stream copy that begins on a delta frame (-copyinkf):
+    // that packet is a residual, not a picture, so no thumbnail is better than
+    // a noise image.
     if (c->thumb_stream_idx < 0 && c->auto_thumbnail && !c->header_written &&
         pkt->stream_index == c->video_stream_idx) {
         av_freep(&c->thumb_data);
-        c->thumb_data = pkt->size ? av_memdup(pkt->data, pkt->size) : NULL;
-        if (pkt->size && !c->thumb_data)
-            return AVERROR(ENOMEM);
-        c->thumb_size = pkt->size;
+        c->thumb_size = 0;
+        if (pkt->size && !miku_packet_is_delta(c, pkt)) {
+            c->thumb_data = av_memdup(pkt->data, pkt->size);
+            if (!c->thumb_data)
+                return AVERROR(ENOMEM);
+            c->thumb_size = pkt->size;
+        }
         c->waiting_thumb = 0;
         ret = miku_resolve_header(s);
         if (ret < 0)
@@ -786,6 +1130,41 @@ static int miku_write_trailer(AVFormatContext *s)
             return ret;
     }
 
+    // References parked by write_video_packet (stream copy, keyframe not seen
+    // yet): every keyframe of the output is known now, so match them by
+    // content. A miss means the keyframe was not copied into this output.
+    for (i = 0; i < c->pend_n; i++) {
+        const MikuDedupSlot *k = miku_table_lookup(&c->kf_t, c->pend[i].digest, c->pend[i].size);
+        if (!k) {
+            av_log(s, AV_LOG_ERROR,
+                   "Frame %d refers to a keyframe that is not part of this output "
+                   "(a stream copy that starts or ends between a frame and the "
+                   "keyframe it is coded against). Cut at a point where every "
+                   "reference stays inside the copy, or re-encode.\n", c->pend[i].frame);
+            return AVERROR(EINVAL);
+        }
+        c->index[c->pend[i].frame].ref = (int32_t)k->value;
+    }
+
+    // Long-term references must point at a real keyframe of this same file
+    // (any position: earlier or later -- a keyframe is a standalone image).
+    // Checked here, with the whole index known, so that a reference to a
+    // later frame is also verifiable; anything else would be a file that
+    // decodes to garbage, so refuse to finish it.
+    for (i = 0; i < c->index_len; i++) {
+        int32_t ref = c->index[i].ref;
+        if (ref < 0)
+            continue;
+        if (ref >= c->index_len || !(c->index[ref].size & MIKU_KEYFRAME_BIT) ||
+            (c->index[i].size & MIKU_KEYFRAME_BIT)) {
+            av_log(s, AV_LOG_ERROR,
+                   "Frame %d has a long-term reference to frame %d, which is "
+                   "not a keyframe in this file (were packets dropped or "
+                   "trimmed between the encoder and the muxer?)\n", i, ref);
+            return AVERROR(EINVAL);
+        }
+    }
+
     if (c->audio_dyn)
         audio_size = avio_close_dyn_buf(c->audio_dyn, &audio_buf);
     c->audio_dyn = NULL;
@@ -796,28 +1175,51 @@ static int miku_write_trailer(AVFormatContext *s)
     av_free(audio_buf);
 
     // Item 4: the real index, written now that every frame's offset/size and
-    // the audio blob's location are finally known.
+    // the audio blob's location are finally known. Entry shape depends on
+    // whether any frame used a long-term reference (see the layout comment
+    // at the top of this file): plain 16-byte entries keep the file readable
+    // by older demuxers; 24-byte entries carry the reference.
     index_offset = avio_tell(s->pb);
     for (i = 0; i < c->index_len; i++) {
         avio_wl64(s->pb, c->index[i].offset);
         avio_wl32(s->pb, c->index[i].size);
         avio_wl32(s->pb, c->index[i].duration);
+        if (c->any_ref) {
+            avio_wl32(s->pb, (uint32_t)c->index[i].ref);
+            avio_wl32(s->pb, 0); // reserved
+        }
     }
     audio_samples_u32 = c->audio_total_samples > 0xFFFFFFFFLL
                              ? 0xFFFFFFFFU : (uint32_t)c->audio_total_samples;
     avio_wl64(s->pb, audio_offset);
     avio_wl32(s->pb, (uint32_t)audio_size);
     avio_wl32(s->pb, audio_samples_u32); // mikudec.c doesn't read this field today; kept for forward compatibility
+    if (c->any_ref)
+        avio_wl64(s->pb, 0); // pad the audio entry out to the v3 stride
 
     end_pos = avio_tell(s->pb);
 
-    // Seek back and patch the only two header fields that couldn't be known
-    // up front (item 4).
+    // Seek back and patch the header fields that couldn't be known up front
+    // (item 4) -- and, only if a long-term reference was actually used, the
+    // format version and codec flag, so old readers refuse the file instead
+    // of mis-decoding it.
     avio_seek(s->pb, MIKU_OFF_FRAME_COUNT, SEEK_SET);
     avio_wl32(s->pb, (uint32_t)c->index_len);
     avio_seek(s->pb, MIKU_OFF_INDEX_OFF, SEEK_SET);
     avio_wl64(s->pb, index_offset);
+    if (c->any_ref) {
+        avio_seek(s->pb, MIKU_OFF_VERSION, SEEK_SET);
+        avio_wl16(s->pb, MIKU_FORMAT_VERSION_REFS);
+        avio_seek(s->pb, MIKU_OFF_CODEC_FLAG, SEEK_SET);
+        avio_w8(s->pb, MIKU_CODEC_WEBP_DELTA_REFS);
+    }
     avio_seek(s->pb, end_pos, SEEK_SET);
+
+    av_log(s, AV_LOG_VERBOSE,
+           "miku: %d frames, %"PRId64" deduplicated (%"PRId64" bytes not written), "
+           "format v%d\n", c->index_len, c->dedup_hits, c->dedup_bytes_saved,
+           c->any_ref ? MIKU_FORMAT_VERSION_REFS
+                      : c->delta_mode ? MIKU_FORMAT_VERSION_DELTA : MIKU_FORMAT_VERSION);
 
     return 0;
 }
@@ -830,6 +1232,11 @@ static void miku_deinit(AVFormatContext *s)
     av_freep(&c->index);
     av_freep(&c->last_frame_data);
     av_freep(&c->thumb_data);
+    miku_table_free(&c->dedup_t);
+    miku_table_free(&c->kf_t);
+    av_freep(&c->pend);
+    c->pend_n = c->pend_cap = 0;
+    av_hash_freep(&c->hash);
     if (c->audio_dyn) {
         avio_close_dyn_buf(c->audio_dyn, &tmp);
         av_free(tmp);
@@ -848,6 +1255,15 @@ static const AVOption miku_mux_options[] = {
       "is a byte copy, not a re-encode. Set to 0 to skip thumbnails entirely when none "
       "was explicitly provided.",
       MOFFSET(auto_thumbnail), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ME },
+    { "dedup", "Store byte-identical video packets only once. 'global' (default) reuses "
+      "the first copy for ANY later identical packet anywhere in the file -- loops, "
+      "returning scenes, repeated slates; 'last' only compares against the immediately "
+      "preceding packet (the old behavior, no hash table); 'off' stores everything. "
+      "Dedup never changes decoded output, only file size.",
+      MOFFSET(dedup), AV_OPT_TYPE_INT, { .i64 = MIKU_DEDUP_GLOBAL }, MIKU_DEDUP_OFF, MIKU_DEDUP_GLOBAL, ME, .unit = "dedup" },
+        { "off",    "no dedup",                       0, AV_OPT_TYPE_CONST, { .i64 = MIKU_DEDUP_OFF },    0, 0, ME, .unit = "dedup" },
+        { "last",   "against the previous packet",    0, AV_OPT_TYPE_CONST, { .i64 = MIKU_DEDUP_LAST },   0, 0, ME, .unit = "dedup" },
+        { "global", "against every earlier packet",   0, AV_OPT_TYPE_CONST, { .i64 = MIKU_DEDUP_GLOBAL }, 0, 0, ME, .unit = "dedup" },
     { NULL },
 };
 
