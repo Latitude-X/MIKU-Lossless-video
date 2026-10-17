@@ -1,5 +1,5 @@
 diff --git a/configure b/configure
-index f542d4e..17f066b 100755
+index f542d4e0..17f066b3 100755
 --- a/configure
 +++ b/configure
 @@ -3196,6 +3196,8 @@ magicyuv_decoder_select="llviddsp"
@@ -22,20 +22,21 @@ index f542d4e..17f066b 100755
  enabled libx264           && require_pkg_config libx264 x264 "stdint.h x264.h" x264_encoder_encode &&
                               require_cpp_condition libx264 x264.h "X264_BUILD >= 155" && {
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index 3d2200a..1624034 100644
+index 3d2200af..f5095779 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -1240,6 +1240,8 @@ OBJS-$(CONFIG_LIBVPX_VP9_ENCODER)         += libvpxenc.o
+@@ -1240,6 +1240,9 @@ OBJS-$(CONFIG_LIBVPX_VP9_ENCODER)         += libvpxenc.o
  OBJS-$(CONFIG_LIBVVENC_ENCODER)           += libvvenc.o
  OBJS-$(CONFIG_LIBWEBP_ENCODER)            += libwebpenc_common.o libwebpenc.o
  OBJS-$(CONFIG_LIBWEBP_ANIM_ENCODER)       += libwebpenc_common.o libwebpenc_animencoder.o
-+OBJS-$(CONFIG_MIKU_ENCODER)               += mikuenc.o # links directly against libwebp, same as the two above
-+OBJS-$(CONFIG_MIKU_DELTA_DECODER)         += mikudeltadec.o # also links libwebp (decode side)
++# The .miku encoder and delta decoder use libwebp directly (see configure)
++OBJS-$(CONFIG_MIKU_ENCODER)               += mikuenc.o
++OBJS-$(CONFIG_MIKU_DELTA_DECODER)         += mikudeltadec.o
  OBJS-$(CONFIG_LIBX262_ENCODER)            += libx264.o
  OBJS-$(CONFIG_LIBX264_ENCODER)            += libx264.o
  OBJS-$(CONFIG_LIBX265_ENCODER)            += libx265.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index 178a0e5..90a9366 100644
+index 178a0e59..90a9366c 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
 @@ -196,6 +196,8 @@ extern const FFCodec ff_magicyuv_encoder;
@@ -48,7 +49,7 @@ index 178a0e5..90a9366 100644
  extern const FFCodec ff_mjpeg_encoder;
  extern const FFCodec ff_mjpeg_decoder;
 diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
-index e91366f..fc9e1e1 100644
+index e91366f4..fc9e1e15 100644
 --- a/libavcodec/codec_desc.c
 +++ b/libavcodec/codec_desc.c
 @@ -2010,6 +2010,23 @@ static const AVCodecDescriptor codec_descriptors[] = {
@@ -76,10 +77,10 @@ index e91366f..fc9e1e1 100644
      {
          .id        = AV_CODEC_ID_PCM_S16LE,
 diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
-index 0133751..236b6e6 100644
+index 0133751d..ca9b54d2 100644
 --- a/libavcodec/codec_id.h
 +++ b/libavcodec/codec_id.h
-@@ -327,6 +327,22 @@ enum AVCodecID {
+@@ -327,6 +327,23 @@ enum AVCodecID {
      AV_CODEC_ID_ASTC,
      AV_CODEC_ID_RW2,
  
@@ -95,18 +96,19 @@ index 0133751..236b6e6 100644
 +    //
 +    // Reserve the top of the range downward for any future fork-local codec
 +    // IDs so they stay grouped together.
-+    AV_CODEC_ID_MIKU_DELTA = 0xFFFE, ///< .miku delta-frame residual (opt-in -delta_frames).
-+                                      ///< NOT standalone WebP bytes -- decoding requires
-+                                      ///< ff_miku_delta_decoder, never the stock webp decoder.
++    AV_CODEC_ID_MIKU_DELTA = 0xFFFE, ///< .miku delta-frame video (-delta_frames, on by default in the miku encoder).
++                                      ///< A keyframe packet is a plain WebP image but a delta packet is a WebP
++                                      ///< image of a residual, so decoding requires ff_miku_delta_decoder,
++                                      ///< never the stock webp decoder.
 +
      /* various PCM "codecs" */
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
      AV_CODEC_ID_PCM_S16LE = 0x10000,
 diff --git a/libavcodec/packet.h b/libavcodec/packet.h
-index 00774a7..f5468ca 100644
+index 00774a70..25f43389 100644
 --- a/libavcodec/packet.h
 +++ b/libavcodec/packet.h
-@@ -383,6 +383,41 @@ enum AVPacketSideDataType {
+@@ -383,6 +383,45 @@ enum AVPacketSideDataType {
       */
      AV_PKT_DATA_HEVC_CONF,
  
@@ -136,20 +138,24 @@ index 00774a7..f5468ca 100644
 +    // side data isn't touched by that mechanism, so it does.
 +    AV_PKT_DATA_MIKU_IS_DELTA,
 +
-+    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder. Attached to a delta
-+    // packet whose reference is a long-term keyframe rather than the
-+    // previous frame. Payload: little-endian int64 frame number of that
-+    // keyframe, followed by the keyframe's own complete WebP bytes. Makes
-+    // the packet self-contained, so the referenced keyframe may be anywhere
-+    // in the file, before or after the frame using it. See mikudec.c and
-+    // mikudeltadec.c.
++    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder (and, for a stream
++    // copy, demuxer -> muxer). Attached to a delta packet whose reference is
++    // a long-term keyframe rather than the previous frame. Payload:
++    // little-endian int64 frame number of that keyframe in the SOURCE file,
++    // followed by the keyframe's own complete WebP bytes. This makes the
++    // packet self-contained, so the referenced keyframe may be anywhere in
++    // the file, before or after the frame using it. The number is only a
++    // hint: the decoder caches decoded references by the keyframe's bytes,
++    // and the muxer matches a stream-copied reference to the keyframe in its
++    // output by content, because source numbering means nothing once frames
++    // are dropped or reordered. See mikudec.c, mikudeltadec.c and mikumux.c.
 +    AV_PKT_DATA_MIKU_REF_FRAME,
 +
      /**
       * The number of side data types.
       * This is not part of the public API/ABI in the sense that it may
 diff --git a/libavformat/Makefile b/libavformat/Makefile
-index 302df28..ed899be 100644
+index 302df282..ed899be4 100644
 --- a/libavformat/Makefile
 +++ b/libavformat/Makefile
 @@ -383,6 +383,8 @@ OBJS-$(CONFIG_MD5_MUXER)                 += hashenc.o
@@ -162,7 +168,7 @@ index 302df28..ed899be 100644
  OBJS-$(CONFIG_MJPEG_DEMUXER)             += rawdec.o
  OBJS-$(CONFIG_MJPEG_MUXER)               += rawenc.o
 diff --git a/libavformat/allformats.c b/libavformat/allformats.c
-index 5795b65..60d2e24 100644
+index 5795b655..60d2e24c 100644
 --- a/libavformat/allformats.c
 +++ b/libavformat/allformats.c
 @@ -282,6 +282,8 @@ extern const FFOutputFormat ff_matroska_audio_muxer;

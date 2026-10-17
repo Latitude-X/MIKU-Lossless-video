@@ -1,73 +1,69 @@
-// mikumux.c — MIKU Lossless Video muxer for FFmpeg
+// mikumux.c — .miku muxer
 //
-// This muxer receives already-encoded packets (WebP video frames, FLAC
-// audio frames) and packages them into the .miku container. It does NOT do
-// any encoding itself -- that's libavcodec's job (the libwebp encoder for
-// video, the native flac encoder for audio). See the reply for why that
-// division of labor is also the answer to the threading question.
+// Packages already-encoded packets into the .miku container: lossless WebP
+// video frames (from the "miku" encoder, or stream-copied from another .miku
+// file) and one FLAC audio stream. It does no encoding itself.
 //
-// v1 is WebP-only. PNG support existed in earlier versions and has been
-// removed: init() now rejects any video stream (primary or thumbnail) whose
-// codec isn't AV_CODEC_ID_WEBP.
+// Accepted streams: one primary video stream whose codec is AV_CODEC_ID_WEBP
+// or AV_CODEC_ID_MIKU_DELTA, exactly one FLAC audio stream, and optionally one
+// attached picture (WebP) used as the thumbnail. The output must be seekable,
+// because the header and the index are filled in after all frames are written.
 //
 // ---------------------------------------------------------------------
 // On-disk layout written by this muxer:
 //   [0, 64)   64-byte header (see field offsets below)
 //   [64, X)   META block: "META" magic, flags u8, json_len u32, json data,
-//             optional thumbnail bytes (present iff flags & MIKU_META_FLAG_THUMBNAIL)
-//   [X, Y)    video frame bytes, back to back, one contiguous WebP image
-//             per frame. DEDUPLICATED GLOBALLY: a packet whose bytes are
-//             identical to ANY earlier packet in the file (not just the
-//             previous one) is not written again -- its index entry just
-//             points at the first copy. See miku_write_video_packet.
+//             optional color block (iff flags & MIKU_META_FLAG_COLOR),
+//             optional thumbnail bytes (iff flags & MIKU_META_FLAG_THUMBNAIL)
+//   [X, Y)    video frame bytes, back to back, one WebP image per frame,
+//             deduplicated: with -dedup global a packet whose bytes equal ANY
+//             earlier packet in the file is not written again, and its index
+//             entry points at the first copy (see miku_write_video_packet)
 //   [Y, Z)    audio blob: a complete embedded FLAC stream ("fLaC" + a single
-//             STREAMINFO metadata block + raw FLAC frames)
-//   [Z, end)  index table: n_frames entries of {offset u64, size u32,
-//             duration u32}, followed by exactly one more entry describing
-//             the audio blob (offset, size, ~total sample count).
-//             Delta mode only (codec_flag == MIKU_CODEC_WEBP_DELTA, header
-//             version == MIKU_FORMAT_VERSION_DELTA): each video entry's size
-//             field has its MSB stolen as a keyframe flag (pkt->flags &
-//             AV_PKT_FLAG_KEY at encode time); the real size is the low 31
-//             bits. Off by default -- with delta mode inactive the size
-//             field is the plain, full-range byte count exactly as before.
+//             STREAMINFO metadata block + the FLAC frames)
+//   [Z, end)  index: n_frames video entries {offset u64, size u32, duration
+//             u32}, then one entry for the audio blob {offset u64, size u32,
+//             total sample count u32, saturating}
 //
-//             LONG-TERM REFERENCES (format v3, codec_flag 0x03). A delta frame
-//             normally reconstructs against the previous frame. With long-term
-//             references it may instead reconstruct against ANY keyframe in
-//             the file -- earlier or later, since a keyframe is a standalone
-//             image and so can always be decoded on demand. Only if at least
-//             one frame actually uses this does the muxer write v3: it patches
-//             the header version/codec_flag in write_trailer and widens every
-//             index entry (including the trailing audio entry) to 24 bytes:
-//                 {offset u64, size u32, duration u32, ref i32, reserved u32}
-//             ref is the index of the reference keyframe, or -1 for none (a
-//             keyframe, or an ordinary delta against the previous frame). A
-//             file that never uses a long-term reference is still written as
-//             plain v2 (16-byte entries), so older readers keep opening it.
+// Versions and index shape:
+//   v1  plain WebP video (codec_flag 0x01); 16-byte index entries.
+//   v2  delta video (codec_flag 0x02): the MSB of each video entry's size is
+//       the keyframe flag (set for a keyframe), the size proper is the low 31
+//       bits; 16-byte entries.
+//   v3  delta video with long-term references (codec_flag 0x03); every entry,
+//       the audio entry included, is 24 bytes:
+//           {offset u64, size u32, duration u32, ref i32, reserved u32}
+//       ref is the index of the keyframe the frame is coded against, or -1 for
+//       none (a keyframe, or a delta against the previous frame). A delta
+//       frame may name ANY keyframe of the file, earlier or later: a keyframe
+//       is a standalone image, so it can always be decoded on demand. v3 is
+//       written only if some frame actually uses a long-term reference;
+//       write_trailer then patches the header version and codec_flag, so that
+//       older readers reject the file instead of misdecoding it. A file with
+//       no such reference stays v1/v2 and older readers keep opening it.
 //
 // Header field byte offsets (64 bytes total):
 //   0   "MIKU" magic (4 bytes)
-//   4   version                 u16
-//   6   fps_num                 u16   -- matches what mikudec.c already reads
-//   8   fps_den                 u16   -- matches what mikudec.c already reads
-//   10  frame_count             u32   -- matches what mikudec.c already reads (placeholder, patched in write_trailer)
-//   14  sample_rate             u32   -- matches what mikudec.c already reads
-//   18  channels                u16   -- matches what mikudec.c already reads
-//   20  bit_depth               u16   -- matches what mikudec.c already reads
-//   22  metadata_offset         u64   -- always 64 (META block is fixed right after the header)
-//   30  index_offset            u64   -- matches what mikudec.c already reads (placeholder, patched in write_trailer)
+//   4   version                 u16   -- 1, 2 or 3, see above
+//   6   fps_num                 u16   -- nominal frame rate
+//   8   fps_den                 u16
+//   10  frame_count             u32   -- placeholder, patched in write_trailer
+//   14  sample_rate             u32   -- of the audio stream
+//   18  channels                u16   -- of the audio stream
+//   20  bit_depth               u16   -- of the audio stream
+//   22  metadata_offset         u64   -- always 64: the META block follows the header
+//   30  index_offset            u64   -- placeholder, patched in write_trailer
 //   38  reserved (7 bytes)
-//   45  codec_flag              u8    -- 0x01 = WebP, the only accepted value in v1 (0x00/PNG is rejected)
+//   45  codec_flag              u8    -- 0x01 WebP, 0x02 delta, 0x03 delta + long-term references
 //   46  video_offset            u64   -- offset of the first video frame byte
 //   54  sar_num                 u16   -- sample aspect ratio numerator, 1 if unset
 //   56  sar_den                 u16   -- sample aspect ratio denominator, 1 if unset
 //   58  reserved (6 bytes)
 //
-// NOTE ON THE THUMBNAIL: the spec doesn't give the thumbnail an explicit length
-// field. Since it's always the last thing in the META block and video_offset
-// marks exactly where it ends, its length is implicit: video_offset - (start of
-// thumbnail data). It must be WebP, same as the primary video stream.
+// NOTE ON THE THUMBNAIL: there is no explicit length field. It is the last
+// thing in the META block and video_offset marks where it ends, so its length
+// is video_offset minus the start of the thumbnail data. It must be WebP, like
+// the primary video stream.
 // ---------------------------------------------------------------------
 
 #include <inttypes.h>
@@ -104,18 +100,16 @@
 #define MIKU_OFF_SAR_DEN        56
 
 #define MIKU_CODEC_WEBP         0x01
-#define MIKU_CODEC_WEBP_DELTA   0x02  // opt-in delta-frame mode (-delta_frames on the
-                                       // encoder); index entries carry a keyframe bit,
-                                       // see miku_write_video_packet. codec_id on the
-                                       // video stream is AV_CODEC_ID_MIKU_DELTA, never
-                                       // AV_CODEC_ID_WEBP, when this flag is written.
+#define MIKU_CODEC_WEBP_DELTA   0x02  // delta-frame video (the encoder's -delta_frames, on by
+                                       // default); index entries carry a keyframe bit, see
+                                       // miku_write_video_packet. The video stream's codec_id
+                                       // is AV_CODEC_ID_MIKU_DELTA, never AV_CODEC_ID_WEBP,
+                                       // when this flag is written.
 
 #define MIKU_FORMAT_VERSION_DELTA 2   // written instead of MIKU_FORMAT_VERSION when
-                                       // MIKU_CODEC_WEBP_DELTA is active. A file written
-                                       // with delta_frames=0 (the default) is byte-for-
-                                       // byte the same header/index shape FFmpeg has
-                                       // always produced -- this only ever appears when
-                                       // delta mode was explicitly requested.
+                                       // MIKU_CODEC_WEBP_DELTA is active; a plain WebP
+                                       // stream (encoder run with -delta_frames 0)
+                                       // keeps the version-1 header and 16-byte entries
 
 #define MIKU_CODEC_WEBP_DELTA_REFS 0x03 // delta mode + at least one long-term reference
                                          // (24-byte index entries); old readers reject
@@ -173,12 +167,11 @@ typedef struct MikuMuxContext {
 
     int auto_thumbnail; // -auto_thumbnail option; see miku_write_packet
 
-    // Resolved once in init() from the video stream's codec_id: 1 iff it's
-    // AV_CODEC_ID_MIKU_DELTA (the encoder only ever emits that id when its
-    // own -delta_frames option was actually turned on). Gates every format
-    // difference below (index entry shape, header version, codec_flag) so
-    // that delta_frames=0 output is provably identical, byte for byte, to
-    // what this muxer has always produced.
+    // Resolved once in init() from the video stream's codec_id: 1 iff it is
+    // AV_CODEC_ID_MIKU_DELTA (the encoder uses that id only when its
+    // -delta_frames option is on). Gates the format differences that delta
+    // video brings (index entry shape, header version, codec_flag); a plain
+    // WebP stream is written in the original version-1 layout.
     int delta_mode;
 
     int waiting_thumb;      // 1 until the thumbnail packet arrives (or write_header
@@ -189,7 +182,7 @@ typedef struct MikuMuxContext {
     uint8_t *thumb_data;
     int      thumb_size;
 
-    // Growable per-frame index (item 4: written for real in write_trailer).
+    // Growable per-frame index, written out in write_trailer.
     MikuIndexEntry *index;
     int index_len, index_cap;
 
@@ -209,7 +202,8 @@ typedef struct MikuMuxContext {
     // byte size; there is no byte-for-byte verification against the old copy
     // (the muxer cannot read back what it has written), so correctness rests
     // on the digest -- an accidental collision between two distinct packets
-    // has probability ~2^-128 per pair. Memory: 32 bytes per unique frame.
+    // has probability ~2^-128 per pair. Memory: one 32-byte slot per unique
+    // frame, in a table kept at most half full, so 64 to 128 bytes per frame.
     int dedup;                    // -dedup option, one of MIKU_DEDUP_*
     struct AVHashContext *hash;   // murmur3, allocated in init() for global dedup / delta mode
     MikuTable      dedup_t;       // digest -> file offset of the first copy
@@ -230,26 +224,24 @@ typedef struct MikuMuxContext {
     MikuPendingRef  *pend;
     int              pend_n, pend_cap;
 
-    // Audio (item 1/6): built up in a dynamic buffer as FLAC packets arrive,
-    // written to the real file as one contiguous blob in write_trailer, since
-    // the container format wants audio as a single indexed region rather than
-    // per-packet entries like video.
+    // Audio: built up in a dynamic buffer as FLAC packets arrive and written
+    // to the file as one contiguous blob in write_trailer, because the
+    // container indexes audio as a single region rather than with per-packet
+    // entries like video.
     AVIOContext *audio_dyn;
     int64_t      audio_total_samples;
 
     int64_t video_data_offset;
 
-    // item 2 (VFR) fix: = fps_den/fps_num exactly as written to the header
-    // by miku_flush_header_and_write. pkt->duration arrives at
-    // miku_write_video_packet already in the *stream's* time_base (that's
-    // FFmpeg's packet contract) -- but this container's declared timebase
-    // is fps_den/fps_num, chosen from avg_frame_rate and independent of
-    // st->time_base. Nothing guarantees those two are the same scale (a
-    // finer st->time_base, common for genuinely VFR sources, makes them
-    // very much not the same scale), so every duration written to the
-    // index has to be explicitly rescaled into this, or the demuxer -- which
-    // has no way to know anything other than "durations are already in
-    // fps_den/fps_num units" -- reconstructs every later frame's pts wrong.
+    // fps_den/fps_num exactly as written to the header by
+    // miku_flush_header_and_write. pkt->duration reaches
+    // miku_write_video_packet in the stream's time_base (the packet
+    // contract), but this container's timebase is fps_den/fps_num, chosen from
+    // avg_frame_rate and independent of st->time_base. The two can differ (a
+    // finer st->time_base is common for VFR sources), so every duration
+    // written to the index is rescaled into this timebase explicitly. The
+    // demuxer can only assume durations are in fps_den/fps_num units, and
+    // would otherwise reconstruct every later pts wrong.
     AVRational hdr_time_base;
 } MikuMuxContext;
 
@@ -440,15 +432,12 @@ static void miku_write_dict_json(AVIOContext *dyn, const AVDictionary *dict)
     avio_w8(dyn, '}');
 }
 
-// Serializes s->metadata, per-stream metadata, and chapters into one JSON
-// object. Top-level keys are s->metadata verbatim, unchanged from before --
-// item 7's original "-metadata key=value" route, so existing readers of the
-// old flat shape see no difference. Stream metadata and chapters are new,
-// namespaced under __miku_streams/__miku_chapters so they can't collide
-// with a real metadata key (a caller would have to go out of their way with
-// "-metadata __miku_chapters=...") and so a reader that only understands
-// the old flat shape just sees two extra, ignorable top-level keys rather
-// than anything that could misparse. Returns a buffer the caller must
+// Serializes s->metadata, the per-stream metadata and the chapters into one
+// JSON object. The top-level keys are s->metadata verbatim (the flat
+// "-metadata key=value" shape). Stream metadata and chapters go under the
+// keys __miku_streams and __miku_chapters, so they cannot collide with an
+// ordinary metadata key, and a reader that only understands the flat shape
+// just sees two extra keys it can ignore. Returns a buffer the caller must
 // av_free().
 static int miku_build_metadata_json(AVFormatContext *s, AVStream *vst, AVStream *ast,
                                      uint8_t **out_buf, int *out_size)
@@ -524,9 +513,9 @@ static int miku_build_metadata_json(AVFormatContext *s, AVStream *vst, AVStream 
     return 0;
 }
 
-// Writes the 64-byte header (with frame_count/index_offset as 0 placeholders
-// -- item 4) and the META block, using whatever thumbnail is currently
-// resolved (none, if no attached-pic stream was ever declared).
+// Writes the 64-byte header (frame_count and index_offset are placeholders
+// that write_trailer patches) and the META block, using whatever thumbnail is
+// currently resolved (none, if no attached-pic stream was ever declared).
 static int miku_flush_header_and_write(AVFormatContext *s)
 {
     MikuMuxContext *c = s->priv_data;
@@ -540,16 +529,13 @@ static int miku_flush_header_and_write(AVFormatContext *s)
     int64_t video_offset;
     uint8_t meta_flags = 0;
     int ret;
-    // HDR/color metadata (bug report follow-up): captured from the video
-    // stream's codecpar, NOT from packet side data. color_primaries/trc/
-    // space/range are plain codecpar fields set regardless of what the
-    // chosen codec's bitstream can represent; mastering-display and
-    // content-light-level are stream-level side data on codecpar itself
-    // (coded_side_data), populated generically by libavcodec's encode path
-    // for any encoder when the input frames carried it -- this is exactly
-    // the mechanism libavformat/movenc.c uses for mdcv/clli boxes, and it
-    // works the same way regardless of codec, since it never depends on the
-    // codec's own bitstream capability.
+    // HDR/colour metadata comes from the video stream's codecpar, not from
+    // packet side data. color_primaries/trc/space/range are plain codecpar
+    // fields, set whatever the codec's bitstream can represent. Mastering-
+    // display and content-light-level are stream-level side data on codecpar
+    // (coded_side_data), which libavcodec's encode path fills in for any
+    // encoder when the input frames carried it -- the same source movenc.c
+    // uses for its mdcv/clli boxes.
     const AVPacketSideData *mdcv_sd, *clli_sd;
     int has_color_info;
 
@@ -572,10 +558,10 @@ static int miku_flush_header_and_write(AVFormatContext *s)
     // and the demuxer leaves codecpar at its own UNSPECIFIED defaults, so
     // SDR sources never get false color tags injected.
 
-    // Nominal FPS for the header. VFR content (item 2) doesn't need this to be
-    // exact -- true per-frame timing lives in the index table's duration
-    // field -- but avg_frame_rate (falling back to 1/time_base) gives readers
-    // a sane reference rate without decoding the whole index first.
+    // Nominal FPS for the header. For VFR content it need not be exact: the
+    // true per-frame timing is the index's duration field. avg_frame_rate
+    // (falling back to 1/time_base) just gives readers a sane reference rate
+    // without reading the whole index first.
     fr = vst->avg_frame_rate;
     if (fr.num <= 0 || fr.den <= 0)
         fr = av_inv_q(vst->time_base);
@@ -585,8 +571,8 @@ static int miku_flush_header_and_write(AVFormatContext *s)
         fr.num = (fr.num + 1) / 2;
         fr.den = (fr.den + 1) / 2;
     }
-    // item 2 (VFR) fix: this is the timebase every duration written to the
-    // index must end up expressed in -- see hdr_time_base's own comment.
+    // Every duration written to the index must be expressed in this
+    // timebase; see hdr_time_base.
     c->hdr_time_base = (AVRational){ fr.den, fr.num };
 
     bit_depth = ast->codecpar->bits_per_raw_sample > 0
@@ -635,9 +621,9 @@ static int miku_flush_header_and_write(AVFormatContext *s)
     }
 
     // Layout: header, "META"+flags+json_len+json, [color block], [thumbnail].
-    // Color block is fixed-shape and self-describing (own size prefixes), so
-    // it goes before the thumbnail -- keeps the thumbnail's own implicit
-    // "everything up to video_offset" length rule simple and unchanged.
+    // The color block has a fixed shape with its own size prefixes, so it goes
+    // before the thumbnail, whose length is implied as "everything up to
+    // video_offset".
     video_offset = MIKU_HEADER_SIZE + 4 /* "META" */ + 1 /* flags */ + 4 /* json_len */
                  + json_size + color_block_size + (c->thumb_data ? c->thumb_size : 0);
     AV_WL64(header + MIKU_OFF_VIDEO_OFF, video_offset);
@@ -727,8 +713,8 @@ static int miku_init(AVFormatContext *s)
     c->audio_stream_idx = -1;
     c->thumb_stream_idx = -1;
 
-    // write_trailer patches the header and appends the index after the fact
-    // (item 4) -- that's only possible on a seekable output.
+    // write_trailer patches the header and appends the index after the fact,
+    // which needs a seekable output.
     if (!s->pb->seekable) {
         av_log(s, AV_LOG_ERROR,
                ".miku requires a seekable output: the header and index are "
@@ -812,7 +798,8 @@ static int miku_write_header(AVFormatContext *s)
     return 0;
 }
 
-// Item 3 (dedup) + item 4 (index) + item 2 (VFR durations).
+// Writes one video frame: dedup, the index entry, and the keyframe/reference
+// bookkeeping.
 //
 // Dedup is two-level. (1) Exact fast path: if this packet is byte-identical
 // to the previous one (checked with memcmp, no hashing), reuse its copy --
@@ -833,10 +820,8 @@ static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
     AVStream *vst = s->streams[c->video_stream_idx];
     int64_t offset;
     uint32_t size;
-    // item 2 (VFR) fix: pkt->duration arrives in vst->time_base (FFmpeg's
-    // packet contract), which is not guaranteed to already equal
-    // hdr_time_base -- see hdr_time_base's own comment. Rescale explicitly
-    // instead of assuming the raw numbers already line up.
+    // pkt->duration is in vst->time_base (the packet contract), which need not
+    // equal hdr_time_base (see its comment), so it is rescaled explicitly.
     int64_t scaled_duration = pkt->duration > 0
         ? av_rescale_q(pkt->duration, vst->time_base, c->hdr_time_base) : 0;
     uint32_t duration = scaled_duration > 0 ? (uint32_t)scaled_duration : 1;
@@ -844,11 +829,10 @@ static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
     // What this frame IS comes first, because it also decides what has to be
     // hashed below.
     //
-    // Delta mode steals size's MSB for the keyframe flag rather than growing
-    // the index entry (WebP/delta payloads won't remotely approach 2GB). This
-    // only ever happens when delta_mode is set (video codec_id ==
-    // AV_CODEC_ID_MIKU_DELTA); with delta_mode off, size_field == size
-    // exactly, unchanged from before delta mode existed.
+    // Delta mode takes the MSB of size for the keyframe flag rather than
+    // growing the index entry (WebP/delta payloads stay far below 2 GB). That
+    // happens only in delta mode (video codec_id == AV_CODEC_ID_MIKU_DELTA);
+    // otherwise size_field is the plain byte count.
     //
     // The bit comes from *this* packet's own role, never from whatever frame
     // its bytes were deduped against -- offset/size say where the bytes live,
@@ -984,8 +968,8 @@ static int miku_write_video_packet(AVFormatContext *s, AVPacket *pkt)
     return miku_index_append(c, offset, size_field, duration, ref);
 }
 
-// Item 1 (accept encoded FLAC packets) + item 6 (single contiguous audio
-// blob, matching what mikudec.c's miku_parse_flac_header expects to find).
+// Appends one encoded FLAC packet to the audio blob, which is a single
+// contiguous FLAC stream, as mikudec.c's miku_parse_flac_header expects.
 static int miku_write_audio_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MikuMuxContext *c = s->priv_data;
@@ -1174,11 +1158,11 @@ static int miku_write_trailer(AVFormatContext *s)
         avio_write(s->pb, audio_buf, audio_size);
     av_free(audio_buf);
 
-    // Item 4: the real index, written now that every frame's offset/size and
-    // the audio blob's location are finally known. Entry shape depends on
-    // whether any frame used a long-term reference (see the layout comment
-    // at the top of this file): plain 16-byte entries keep the file readable
-    // by older demuxers; 24-byte entries carry the reference.
+    // The index, written now that every frame's offset/size and the audio
+    // blob's location are known. The entry shape depends on whether any frame
+    // used a long-term reference (see the layout comment at the top of this
+    // file): plain 16-byte entries keep the file readable by older demuxers,
+    // 24-byte entries carry the reference.
     index_offset = avio_tell(s->pb);
     for (i = 0; i < c->index_len; i++) {
         avio_wl64(s->pb, c->index[i].offset);
@@ -1199,10 +1183,10 @@ static int miku_write_trailer(AVFormatContext *s)
 
     end_pos = avio_tell(s->pb);
 
-    // Seek back and patch the header fields that couldn't be known up front
-    // (item 4) -- and, only if a long-term reference was actually used, the
-    // format version and codec flag, so old readers refuse the file instead
-    // of mis-decoding it.
+    // Seek back and patch the header fields that were not known up front:
+    // frame_count and index_offset and, only if a long-term reference was
+    // used, the format version and codec flag, so that older readers refuse
+    // the file instead of misdecoding it.
     avio_seek(s->pb, MIKU_OFF_FRAME_COUNT, SEEK_SET);
     avio_wl32(s->pb, (uint32_t)c->index_len);
     avio_seek(s->pb, MIKU_OFF_INDEX_OFF, SEEK_SET);
@@ -1258,7 +1242,7 @@ static const AVOption miku_mux_options[] = {
     { "dedup", "Store byte-identical video packets only once. 'global' (default) reuses "
       "the first copy for ANY later identical packet anywhere in the file -- loops, "
       "returning scenes, repeated slates; 'last' only compares against the immediately "
-      "preceding packet (the old behavior, no hash table); 'off' stores everything. "
+      "preceding packet (no hash table); 'off' stores everything. "
       "Dedup never changes decoded output, only file size.",
       MOFFSET(dedup), AV_OPT_TYPE_INT, { .i64 = MIKU_DEDUP_GLOBAL }, MIKU_DEDUP_OFF, MIKU_DEDUP_GLOBAL, ME, .unit = "dedup" },
         { "off",    "no dedup",                       0, AV_OPT_TYPE_CONST, { .i64 = MIKU_DEDUP_OFF },    0, 0, ME, .unit = "dedup" },
@@ -1278,8 +1262,8 @@ const FFOutputFormat ff_miku_muxer = {
     .p.name         = "miku",
     .p.long_name    = NULL_IF_CONFIG_SMALL("MIKU Lossless Video"),
     .p.extensions   = "miku",
-    // v1 is WebP-only (init() rejects anything else); WebP is also the
-    // default a caller gets if -c:v isn't passed explicitly.
+    // WebP is the default video codec when -c:v is not given; init() also
+    // accepts the miku encoder's delta id, AV_CODEC_ID_MIKU_DELTA.
     .p.audio_codec  = AV_CODEC_ID_FLAC,
     .p.video_codec  = AV_CODEC_ID_WEBP,
     .p.flags        = AVFMT_GLOBALHEADER | AVFMT_VARIABLE_FPS,

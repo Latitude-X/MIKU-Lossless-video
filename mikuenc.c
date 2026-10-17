@@ -1,143 +1,116 @@
-// mikuenc.c — fast, frame-parallel lossless WebP (VP8L) encoder for .miku,
-// with delta-frame support
+// mikuenc.c — lossless WebP (VP8L) video encoder for .miku, with optional
+// delta frames
 //
-// Design summary (see the chat reply for the full plan and the benchmarks
-// that motivated it):
+// OVERVIEW
 //
-//   - Conversion isn't the bottleneck. Measured on this machine: YUV420P->
-//     BGRA via swscale costs ~1.7ms/frame at 1080p regardless of content or
-//     settings. VP8L's own compression search costs 9ms-2900ms/frame
-//     depending on content complexity and effort level -- three orders of
-//     magnitude more variation, and it's where all the real time goes.
-//     So this encoder does NOT do its own pixel-format conversion at all:
-//     it declares AV_PIX_FMT_BGRA as its only accepted input format and
-//     lets FFmpeg's ordinary implicit-scale pipeline (backed by swscale,
-//     already well-optimized) handle anything else upstream.
+//   - A thin wrapper around libwebp (WebPPicture / WebPConfig / WebPEncode);
+//     VP8L itself is not reimplemented here.
 //
-//   - THREADING HAS CHANGED from the original dedup-only version. That
-//     version got its parallelism for free from AV_CODEC_CAP_FRAME_THREADS
-//     (the generic framework opening N independent encoder instances and
-//     round-robining frames across them) because every frame really was
-//     independent. Delta chains break that: consecutive frames need shared
-//     reference-frame state, which round-robin-across-independent-instances
-//     cannot provide, and there is no reliable way for one instance to
-//     detect it's being opened as a frame-threading worker and refuse (see
-//     the reply, and the git history of this file, for the full trace
-//     through frame_thread_encoder.c that established this).
+//   - Input is BGRA only (CODEC_PIXFMTS below), which is WebP's ARGB memory
+//     layout; any other pixel format is converted by the implicit scaler that
+//     FFmpeg puts in front of the encoder. Conversion is cheap next to the
+//     VP8L search. Development benchmarks (not re-measured): about 1.7 ms per
+//     1080p frame for swscale, against 9 ms to 2.9 s per frame for libwebp
+//     depending on content and effort.
 //
-//     This version replaces that entirely with its own hand-rolled
-//     producer/worker-pool architecture, used uniformly for BOTH
-//     delta_frames=0 and delta_frames=1 -- not just to make delta mode
-//     safe, but because it restores real multi-core parallelism for
-//     delta_frames=0 too, which AV_CODEC_CAP_FRAME_THREADS's removal had
-//     otherwise cost. AV_CODEC_CAP_FRAME_THREADS is no longer declared at
-//     all; this encoder now always manages its own threads.
+//   - With -delta_frames 0 every packet is a standalone VP8L image. With
+//     -delta_frames 1 (the default) miku_encode_init switches avctx->codec_id
+//     to AV_CODEC_ID_MIKU_DELTA and each frame is coded as one of
+//         keyframe             a standalone image (AV_PKT_FLAG_KEY)
+//         delta vs previous    the per-byte difference to the previous frame,
+//                              mod 256, as a VP8L image
+//         delta vs pooled key  the same against a remembered keyframe (see
+//                              LONG-TERM REFERENCES); a chain root
+//     Delta packets carry AV_PKT_DATA_MIKU_IS_DELTA side data
+//     (miku_encode_frame), which mikumux.c turns into index entries.
 //
-//     The key insight the architecture rests on: only *delta computation*
-//     needs to be sequential (cheap, per-pixel subtract, plus the adaptive
-//     block-ending heuristic) -- it runs on the calling thread, in the
-//     encode() callback itself, exactly as before, so it's automatically
-//     ordered correctly (only one thread ever calls encode()). What moves
-//     onto worker threads is only the expensive part: WebPEncode itself,
-//     which has no cross-frame dependency regardless of mode. A small pool
-//     of persistent worker threads pulls pre-computed pixel buffers
-//     (either a raw keyframe or an already-computed delta residual --
-//     worker threads never touch ref_frame or do any subtraction) from a
-//     ring buffer and compresses them in parallel; the main thread hands
-//     packets back to the caller in strict submission order regardless of
-//     which worker finishes which job when, via the exact same
-//     finished_task_index bookkeeping frame_thread_encoder.c uses for the
-//     analogous problem (see miku_encode_frame's retrieval logic, and
-//     MIKU_TASK_SLACK's comment, for why that specific pattern -- adopted
-//     directly rather than re-derived).
+// THREADING
 //
-//     One correctness point that only matters once multiple WebPEncode
-//     calls can be in flight at once (never an issue in the old, purely
-//     sequential version): the delta-buffer exact=1 override (see below)
-//     used to be implemented by flipping s->config.exact and restoring it
-//     right after a single synchronous WebPEncode call. With N workers
-//     potentially calling WebPEncode concurrently, mutating a *shared*
-//     config like that is a real data race. Each worker now builds its own
-//     local WebPConfig copy (a cheap struct copy; s->config itself is never
-//     mutated after init(), so concurrent reads of it are safe) and
-//     overrides .exact on that local copy only, per task.
+//   - The encoder runs its own worker pool, for -delta_frames 0 and 1 alike.
+//     AV_CODEC_CAP_FRAME_THREADS is not declared: frame threading runs
+//     independent encoder instances on alternate frames, and a delta chain
+//     needs the previous frame's pixels.
 //
-//   - It's a thin, correctness-preserving wrapper around libwebp's actual
-//     VP8L implementation (WebPPicture / WebPConfig / WebPEncode), not a
-//     reimplementation. See the reply for why a from-scratch or GPU VP8L
-//     encoder is not a short-term-feasible alternative to this.
+//   - Only the delta computation has to be sequential: a per-byte subtraction
+//     plus the delta-or-keyframe decision. It runs in miku_prepare_task on the
+//     one thread that calls encode(), so it needs no locking and is ordered
+//     for free. The expensive part, WebPEncode, has no cross-frame dependency:
+//     the producer fills a task slot with the pixels to compress (a raw frame
+//     or a finished residual) and persistent workers compress slots in
+//     parallel. miku_encode_frame returns packets strictly in submission
+//     order, with the same finished_task_index bookkeeping as
+//     libavcodec/frame_thread_encoder.c (see MIKU_TASK_SLACK).
 //
-//   - Every frame is copied into an owned buffer before being handed to
-//     WebPEncode, even though BGRA already matches WebP's ARGB memory
-//     layout byte-for-byte and a direct pointer into frame->data[0] would
-//     look like a free zero-copy optimization. It isn't safe: tested
-//     empirically, WebPEncode mutates its argb input in place (with
-//     exact=0, it zeroes RGB under fully-transparent pixels in the actual
-//     buffer it was given, not a private copy). Pointing it straight at
-//     the caller's AVFrame would silently corrupt that frame.
+//   - s->config is not modified after miku_encode_init, so workers read it
+//     concurrently; a worker that needs different settings for a task edits
+//     its own copy (see miku_worker).
 //
-//   - Delta buffers carry a residual in their alpha channel too (curr_alpha
-//     - ref_alpha), not real transparency -- but WebPEncode doesn't know
-//     that. Its default exact=0 behavior (correct and desired for a real
-//     image's genuinely-transparent pixels) actively corrupts a delta
-//     buffer at every pixel whose real alpha simply didn't change between
-//     frames (residual alpha 0 there is common, not rare): confirmed
-//     empirically, an all-zero-alpha-delta frame (real content, alpha just
-//     constant) decoded back as an entirely blank image, RGB deltas
-//     silently discarded. Forcing exact=1 specifically for delta-buffer
-//     tasks (see above) fixes this without changing the user's own -exact
-//     setting for keyframes -- when delta_frames is off, where nothing
-//     ever reconstructs against a keyframe's ref_frame cross-frame, so
-//     there's nothing for exact=0's RGB-under-transparency freedom to
-//     corrupt. When delta_frames is on, the same keyframe *is* referenced
-//     that way (it seeds the block's delta chain), so miku_worker forces
-//     exact=1 there too -- same underlying reason, just one hop removed
-//     from the delta buffers themselves. See -exact's own option
-//     description for the user-facing summary.
+//   - WebPConfig.thread_level (-thread_level, off by default) makes libwebp
+//     parallelise inside one image. It is independent of the pool, which
+//     parallelises across images. No benchmark of it is recorded here.
 //
-//   - HDR/color metadata needs no special-case code here at all: it's
-//     handled generically by libavcodec/encode.c (color_primaries/trc/
-//     space/range on AVCodecContext, and coded_side_data for mastering-
-//     display/content-light) before/after this encoder's own callback
-//     runs, identical to how it already works for every other encoder.
+// FRAME COPIES AND exact=1
 //
-//   - WebPConfig.thread_level ("try internal multi-threaded encoding") is
-//     exposed as an option but its benefit is unverified here (see the
-//     reply for the benchmark); it's a completely separate axis from the
-//     worker-pool threading in this file -- one parallelizes the search
-//     *within* a single image, the other parallelizes *across* images.
+//   - Every frame is copied before it reaches libwebp, although BGRA already
+//     matches WebP's ARGB layout. With exact=0 WebPEncode modifies pic.argb
+//     in place (it zeroes RGB under fully transparent pixels), so pointing it
+//     at the caller's AVFrame would corrupt that frame.
 //
-//   - LONG-TERM REFERENCES (-delta_refs). A delta frame no longer has to be
-//     a delta against the previous frame: it may instead be a delta against
-//     any KEYFRAME the encoder still remembers -- a bounded pool of the most
-//     useful recent keyframes, kept as raw pixels in RAM. That is what makes
-//     a returning scene (A..A B..B A..A) cheap: the second A reconstructs
-//     against the first A's keyframe instead of costing a fresh keyframe. It
-//     also replaces the forced keyframe every 100 frames: when a chain hits
-//     its length cap, the next frame becomes a new chain root as a delta
-//     against a remembered keyframe, and a full keyframe is only paid for
-//     when that genuinely wouldn't be smaller.
+//   - A delta buffer stores the alpha residual in its alpha channel, so a
+//     pixel whose alpha did not change has alpha 0 there. With exact=0 libwebp
+//     would drop the RGB residual of every such pixel; a frame whose content
+//     changed but whose alpha stayed constant decoded as a blank image. Delta
+//     tasks are therefore always encoded with exact=1. Keyframes are too when
+//     -delta_frames is on, because later deltas are computed against a
+//     keyframe's exact pixels: if libwebp changed RGB under alpha=0, the
+//     decoder's reference would differ from the encoder's there. Only with
+//     -delta_frames 0 does -exact apply to keyframes as given (miku_worker).
 //
-//     Why only keyframes (never another delta) can be referenced: a keyframe
-//     is a standalone image, so the demuxer/decoder can always fetch and
-//     decode it on demand from anywhere in the file, and a seek never has to
-//     walk an arbitrary dependency graph -- the worst case is still "one
-//     chain of at most 100 frames plus one keyframe". A frame coded against
-//     a long-term reference is a chain root, just like a keyframe.
+//   - This file has no HDR or colour handling. The colour properties on the
+//     AVCodecContext and the mastering-display / content-light side data
+//     (which ff_encode_preinit copies into coded_side_data) reach the muxer
+//     through the stream's codec parameters, and mikumux.c stores them in the
+//     META colour block. The VP8L payload carries none of it.
 //
-//     Direction: references here always point backwards (to a keyframe that
-//     was already encoded) because this is a single-pass streaming encoder
-//     and cannot know the future. The container, demuxer and decoder do not
-//     care -- a reference to a later keyframe is equally valid there.
+// DELTA OR KEYFRAME
 //
-//     Cost control: finding a reference must not slow the (single-threaded)
-//     producer step. Each frame is summarised by a fixed set of ~2048 sample
-//     pixels; ranking every pooled keyframe is then a few thousand compares,
-//     and a full-frame diff is run only against the single best candidate,
-//     and only when the previous-frame delta is not already clearly good (or
-//     the chain is at its cap). Decisions depend only on frame content and
-//     the options, never on timing or thread count, so output is still
-//     byte-identical across runs and -threads values.
+//   With -delta_auto 1 (the default) the choice is made per frame from a cost
+//   model fitted to the encoder's own packet sizes; see the comment on
+//   MikuEncContext's auto-tuning fields. With -delta_auto 0 a frame is coded
+//   as a delta when its fraction of unchanged bytes reaches -delta_threshold.
+//   Either way a chain holds at most 100 frames (frames_in_block); the frame
+//   after that has to be a new chain root.
+//
+// LONG-TERM REFERENCES (-delta_refs)
+//
+//   A delta frame need not be a delta against the previous frame: it may be a
+//   delta against any KEYFRAME the encoder still remembers, from a bounded
+//   pool of recent keyframes kept as raw pixels in RAM (-delta_refs,
+//   -delta_ref_mem). A returning scene (A..A B..B A..A) then costs a delta
+//   against the first A instead of a fresh keyframe. It also replaces the
+//   forced keyframe at the end of a 100-frame chain: the next frame becomes a
+//   new chain root coded against the best remembered keyframe, unless the
+//   normal delta-or-keyframe decision prefers a full keyframe. A frame coded
+//   against a long-term reference is a chain root, like a keyframe.
+//
+//   Only keyframes can be referenced. A keyframe is a standalone image, so a
+//   reader can fetch and decode it on demand from anywhere in the file and a
+//   seek never walks a dependency graph: the worst case is one keyframe plus
+//   one chain of at most 100 frames.
+//
+//   This encoder only emits references to earlier keyframes: it is a
+//   single-pass streaming encoder and cannot know the future. The index
+//   format and the demuxer accept a reference to any keyframe of the file.
+//
+//   Cost control: the producer step is sequential, so the search has to be
+//   cheap. A frame is summarised, lazily, by MIKU_LT_SAMPLES sampled pixels.
+//   Ranking a pooled keyframe is one comparison of two such sample vectors,
+//   and a full-frame diff is run only against the single best candidate, and
+//   only when the previous-frame delta is not already clearly good
+//   (MIKU_LT_SKIP_ZERO) or the chain is at its cap. Decisions depend only on
+//   frame content and the options, never on timing or thread count (see the
+//   auto-tuning comment on MikuEncContext for the thread limit), so output
+//   is byte-identical across runs and -threads values.
 
 #include <inttypes.h>
 #include <limits.h>
@@ -159,50 +132,39 @@
 #include "libavutil/time.h"
 #include "pthread_internal.h"
 
-// One extra slot beyond the worker count, same rationale as
-// frame_thread_encoder.c's own BUFFER_SIZE (MAX_THREADS + 2): with a ring
-// buffer sized to exactly the thread count, the "queue full" and "queue
-// empty" states become indistinguishable (task_index could wrap around to
-// equal finished_task_index in both cases). One spare slot resolves the
-// ambiguity. Adopted directly from that proven, real, in-tree pattern
-// rather than re-derived.
+// The task ring holds nthreads + MIKU_TASK_SLACK slots. At most nthreads + 1
+// tasks are outstanding at once (miku_encode_frame blocks for the oldest
+// result beyond that), so the ring is never completely full, and a full ring
+// cannot be mistaken for an empty one (task_index == finished_task_index).
+// frame_thread_encoder.c sizes its ring the same way (MAX_THREADS + 2).
 #define MIKU_TASK_SLACK 2
 
 typedef struct MikuTask {
-    // Input, set by the main thread before dispatch. pixels is fixed-size
-    // (allocated once in init(), sized to the stream's resolution) and
-    // never reallocated -- avoids any chance of a worker reading a buffer
-    // the main thread is mid-realloc on. Exclusively owned by whichever
-    // side currently "has" this slot: the main thread while filling it
-    // before dispatch and after retrieval, a single worker thread while
-    // task_pending is set and finished is not yet set. The ring-buffer
-    // backpressure logic (mirroring frame_thread_encoder.c) guarantees
-    // the main thread never reuses a slot before the previous occupant's
-    // packet has been retrieved, so there's never a moment two threads
-    // both believe they own the same slot.
+    // Input, set by the producer (the main thread) before dispatch. `pixels`
+    // is allocated once in init() at the stream's frame size and never
+    // reallocated. A slot belongs to one side at a time: the main thread while
+    // it fills the slot and after it retrieves the packet, a single worker
+    // from dispatch until `finished` is set. The backpressure in
+    // miku_encode_frame ensures a slot is not refilled before its previous
+    // packet has been retrieved.
     uint8_t *pixels;
-    int is_keyframe; // decided by the sequential producer step, before
-                      // dispatch -- workers never compute this themselves
-    int64_t frame_no;   // submission-order index; keys this task's stats record
-    int64_t nonzero;    // non-zero residual bytes (delta tasks only), for auto-tuning
-    int64_t ref_frame_no; // >= 0: this delta is against that long-term reference
-                          // keyframe (its frame number); -1: previous frame / keyframe
+    int is_keyframe;      // decided by the producer; workers only read it
+    int64_t frame_no;     // submission-order index; keys this task's stats record
+    int64_t nonzero;      // non-zero residual bytes (delta tasks only), for auto-tuning
+    int64_t ref_frame_no; // >= 0: delta against that long-term reference keyframe
+                          // (its frame number); -1: previous frame / keyframe
     int64_t pts;
-    int64_t duration; // carried through explicitly: AV_CODEC_CAP_DELAY
-                       // (see the FFCodec struct below) means the generic
-                       // pipeline no longer derives pkt duration for us
-                       // from the input frame the way it used to.
+    int64_t duration;     // copied from the input frame: with AV_CODEC_CAP_DELAY
+                          // encode.c does not set the packet duration
 
-    // Output, set by the worker, read by the main thread at retrieval.
-    uint8_t *out_data; // owned; freed via WebPMemoryWriterClear at
-                        // retrieval (or at close(), for any task still
-                        // outstanding -- shouldn't happen after a full
-                        // flush, but close() doesn't assume flush ran)
+    // Output, written by the worker and read by the main thread at retrieval.
+    uint8_t *out_data;    // owned; released with WebPMemoryWriterClear at
+                          // retrieval, or in close() if never retrieved
     size_t out_size;
     int encode_failed;
     int webp_error_code;
 
-    int finished; // guarded by finished_task_mutex
+    int finished;         // guarded by finished_task_mutex
 } MikuTask;
 
 // Per-frame outcome, written at retrieval (main thread) and consumed
@@ -216,11 +178,11 @@ typedef struct MikuStatRec {
 } MikuStatRec;
 
 // Minimum number of frames between a frame's submission and the moment its
-// result is allowed to influence a decision. The actual lag is
-// max(this, ntasks): a fixed lag, independent of timing and (for thread
-// counts below this - 2) of -threads, is what keeps output deterministic --
-// see the auto-tuning comment on MikuEncContext. Must exceed the max number
-// of in-flight tasks so the record being consumed has always been retrieved.
+// result may influence a decision. The lag actually used is max(this, ntasks).
+// It is fixed, so output does not depend on timing, and it does not depend on
+// -threads either while ntasks <= this (at most this - MIKU_TASK_SLACK
+// threads); see the auto-tuning comment on MikuEncContext. It must exceed the
+// number of in-flight tasks so the record being consumed has been retrieved.
 #define MIKU_AUTO_LAG 24
 // If no delta has been chosen for this many frames, force one probe (when
 // the frame is at least plausibly similar to its predecessor) so the
@@ -252,85 +214,74 @@ typedef struct MikuLTRef {
 
 typedef struct MikuEncContext {
     AVClass *class;
-    WebPConfig config; // never mutated after init() -- safe for concurrent
-                        // reads from multiple worker threads
-    int method; // 0 (fastest) - 6 (slowest/best); WebPConfig's own documented range
-    int exact;  // preserve exact RGB under fully-transparent alpha (matches WebPConfig.exact)
-    int thread_level; // maps to WebPConfig.thread_level -- see the reply for why this
-                       // is exposed despite unproven benefit on this specific hardware
+    WebPConfig config; // not modified after init(), so workers may read it
+                       // concurrently
+    int method;       // -method: effort level 0 (fastest) - 9 (best), the `level` of
+                      // WebPConfigLosslessPreset; see the option text for the mapping
+    int exact;        // -exact: WebPConfig.exact for keyframes (miku_worker says
+                      // when it is overridden)
+    int thread_level; // -thread_level: WebPConfig.thread_level (libwebp's own
+                      // threading inside one image)
 
-    int delta_frames; // -delta_frames option; see miku_encode_init for what
-                       // flipping this does to avctx->codec_id
-    double delta_threshold; // -delta_threshold: fraction of unchanged bytes
-                       // (0..1) above which a candidate frame is encoded as
-                       // a delta rather than ending the block early. NOT YET
-                       // empirically tuned against real footage the way
-                       // method/thread_level were -- 0.5 is a reasonable
-                       // starting point, exposed as an option specifically
-                       // so it can be benchmarked and adjusted later rather
-                       // than hardcoded.
-    int delta_method;  // -delta_method: WebP method (effort level) for delta-
-                        // residual tasks specifically, independent of -method
-                        // (keyframes still use that). See miku_worker and the
-                        // reply: the frames_in_block/delta_threshold heuristic
-                        // above is a single whole-frame statistic, so a small
-                        // persistently-complex pocket inside an otherwise-
-                        // static frame (noise, heavy grain) can clear
-                        // delta_threshold easily while still costing a full
-                        // keyframe's worth of VP8L search time. This bounds
-                        // that worst case directly rather than trying to
-                        // predict it upfront.
+    int delta_frames; // -delta_frames; when set, init switches avctx->codec_id to
+                      // AV_CODEC_ID_MIKU_DELTA
+    double delta_threshold; // -delta_threshold: fraction of unchanged bytes (0..1)
+                      // at or above which a candidate frame is coded as a delta.
+                      // The auto-tuner's warm-up rule and, with -delta_auto 0,
+                      // the only rule. The default (0.5) is an untuned starting
+                      // value.
+    int delta_method; // -delta_method: cap on libwebp's method (0-6) for delta-
+                      // residual tasks; keyframes use the method -method selects.
+                      // The delta decision rests on a whole-frame statistic, so
+                      // a small, persistently complex region (noise, grain) can
+                      // pass it and still cost a keyframe's worth of search
+                      // time; the cap bounds that. See miku_worker.
 
-    // ---- Sequential producer state (touched only by the thread calling
-    // encode(), which is always exactly one thread -- none of this needs
-    // locking, same as it never did before threading existed here) ----
+    // ---- Sequential producer state: touched only by the thread that calls
+    // encode(), so none of it needs locking ----
 
-    // scratch always holds this call's frame's true raw pixels, copied
-    // fresh from the AVFrame every call. Reused across calls (grown, never
-    // shrunk) to avoid a malloc/free per frame.
+    // The current frame's raw pixels, copied from the AVFrame at the start of
+    // every call; allocated once in init().
     uint8_t *scratch;
     int64_t scratch_size;
 
-    // ref_frame always holds a clean copy of the most recently processed
-    // frame's RAW pixels -- "frame N-1" while processing frame N.
-    // Deliberately a separate buffer from `scratch`, updated by explicit
-    // copy before dispatch: whichever task slot ends up holding frame N's
-    // pixels is about to be handed to a worker that may run at any time
-    // after dispatch, so ref_frame must already have its own independent
-    // copy before that happens, not rely on reading back from a slot a
-    // worker might be touching.
+    // The previous frame's raw pixels ("frame N-1" while frame N is
+    // prepared). A private copy rather than a pointer into a task slot: once
+    // dispatched, a slot may be read and modified by a worker at any time
+    // (WebPEncode edits its input in place).
     uint8_t *ref_frame;
     int64_t ref_frame_size;
     int have_reference; // 0 until ref_frame holds a real previous frame
 
-    uint8_t *delta_buf; // scratch for the residual (curr - ref, mod 256);
-                         // same size as scratch/ref_frame once allocated
+    uint8_t *delta_buf; // residual of the current frame against ref_frame,
+                        // (cur - ref) mod 256 per byte
     int64_t delta_buf_size;
 
-    int frames_in_block; // frames encoded since (and including) the current
-                          // block's keyframe; block ends (forcing a fresh
-                          // keyframe) at 100 regardless of how favorable
-                          // deltas remain, per spec
+    int frames_in_block; // frames in the current chain, counting its root (a
+                         // keyframe, or a frame coded against a long-term
+                         // reference). A chain holds at most 100 frames, which
+                         // bounds how far a seek has to walk back to a root.
 
     // ---- Delta auto-tuning (-delta_auto, default on) ----
     //
-    // Replaces the fixed delta_threshold guess with a cost model learned
-    // from the encoder's own output, at ~zero extra cost: no extra
-    // WebPEncode calls, no extra pixel passes (zero_count is already
-    // computed for the old heuristic). Per frame the decision is:
+    // Instead of a fixed -delta_threshold, the delta-or-keyframe decision uses
+    // a cost model fitted to this stream's own packets. It needs no extra
+    // WebPEncode calls and no extra pixel pass (the unchanged-byte count is
+    // computed anyway). Per frame:
     //     predicted_delta_bytes = (EMA delta bytes / EMA delta nonzero) * nonzero
     //     delta iff predicted_delta_bytes <= EMA keyframe bytes * delta_margin
-    // where both EMAs come from real packets of the current stream.
+    // with both EMAs taken from real packets. miku_auto_wants_delta also holds
+    // the warm-up rule (used until both kinds of packet have been fed back)
+    // and the periodic delta probe.
     //
-    // DETERMINISM: results arrive from workers in timing-dependent order,
-    // so feeding them to the tuner "as they arrive" would make output
-    // differ run to run. Instead each result is stored in `hist` keyed by
-    // frame number, and the tuner consumes frame N-lag's record only when
-    // preparing frame N, with lag fixed (max(MIKU_AUTO_LAG, ntasks)). Since
-    // the queue never holds more than nthreads+1 tasks, that record has
-    // always been retrieved by then, so decisions depend only on frame
-    // content and settings -- byte-identical output across runs and across
-    // -threads values (up to MIKU_AUTO_LAG-2 threads).
+    // DETERMINISM: workers finish in timing-dependent order, so results cannot
+    // be fed to the tuner as they arrive. Each result is stored in `hist`,
+    // keyed by frame number, and the tuner reads frame N-lag's record only
+    // when preparing frame N, with lag fixed at max(MIKU_AUTO_LAG, ntasks). At
+    // most nthreads + 1 tasks are ever outstanding, so that record has always
+    // been retrieved by then. Decisions therefore depend only on frame
+    // content and the options, and output is byte-identical across runs and
+    // across -threads values up to MIKU_AUTO_LAG - MIKU_TASK_SLACK threads.
     int delta_auto;
     double delta_margin; // delta must be predicted at most this fraction of a keyframe
     MikuStatRec *hist;
@@ -409,33 +360,25 @@ static void *miku_worker(void *arg)
 
         task = &s->tasks[idx];
 
-        // Local config copy: see this file's header comment for why this
-        // can't be a mutate-then-restore on the shared s->config anymore
-        // now that multiple workers can be inside WebPEncode at once.
+        // Work on a copy: several workers can be inside WebPEncode at once, so
+        // the shared s->config must stay read-only.
         local_config = s->config;
 
-        // Keyframes need exact=1 too, but only once delta_frames is on:
-        // this keyframe becomes the ref_frame a delta chain reconstructs
-        // against, and if exact=0 lets WebP pick different RGB under
-        // alpha=0 here, the encoder's true ref_frame and the decoder's
-        // reconstructed one silently diverge at every pixel that was
-        // transparent on this keyframe. Invisible right up until (if
-        // ever) alpha moves off zero there later in the chain, at which
-        // point it surfaces as real, visible corruption -- see the reply.
-        // Harmless, and correctly left alone, when delta_frames is off:
-        // nothing ever references this keyframe's ref_frame cross-frame
-        // in that mode, so -exact keeps meaning exactly what its own
-        // description says.
+        // Delta residuals always use exact=1 (see the header comment). So do
+        // keyframes once delta_frames is on: later deltas are computed against
+        // the keyframe's exact pixels, and if libwebp changed RGB under alpha=0
+        // here, the decoder's reference would differ from the encoder's at
+        // those pixels, which shows up as corruption once alpha becomes
+        // non-zero there later in the chain. With delta_frames off nothing is
+        // computed against a keyframe, so -exact applies as given.
         if (task->is_keyframe == 0 || s->delta_frames)
             local_config.exact = 1;
 
         if (task->is_keyframe == 0) {
-            // Independent of exact: retrieval in miku_encode_frame is
-            // strict submission order, so one task stuck in a slow
-            // WebPEncode call blocks every later packet no matter how
-            // many other workers are idle -- see the reply for why that
-            // turns a single locally-complex frame into a sustained
-            // playback slowdown rather than one skipped beat.
+            // Delta residuals are capped at -delta_method effort. Packets are
+            // returned in submission order, so one slow WebPEncode call holds
+            // back every later packet however many workers are idle; the cap
+            // bounds that stall.
             if (local_config.method > s->delta_method)
                 local_config.method = s->delta_method;
         }
@@ -478,18 +421,16 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
     int ret;
 
     if (avctx->pix_fmt != AV_PIX_FMT_BGRA) {
-        // Shouldn't happen -- FFmpeg only hands us formats from p.pix_fmts --
-        // but WebPEncode's correctness depends entirely on argb/argb_stride
-        // actually being BGRA-laid-out memory, so this is cheap insurance
-        // against ever silently encoding garbage.
+        // Only BGRA is offered (CODEC_PIXFMTS), so this should not happen; it
+        // guards the argb/argb_stride assumption made when calling WebPEncode.
         av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format (expected bgra)\n");
         return AVERROR(EINVAL);
     }
 
-    // Flip the output codec_id before any downstream code (the muxer, via
-    // st->codecpar->codec_id) reads it, so a delta-mode stream is never
-    // mistaken for a plain WebP one. Verified empirically end-to-end that
-    // this propagates correctly.
+    // A delta-mode stream is announced to the muxer as AV_CODEC_ID_MIKU_DELTA
+    // instead of WEBP. The ffmpeg CLI copies the encoder context into the
+    // output stream's codec parameters (avcodec_parameters_from_context) once
+    // the encoder is open, so this reaches mikumux.c as codecpar->codec_id.
     if (s->delta_frames)
         avctx->codec_id = AV_CODEC_ID_MIKU_DELTA;
 
@@ -561,44 +502,16 @@ static av_cold int miku_encode_init(AVCodecContext *avctx)
             }
         }
 
-        // avctx->thread_count is 0 here on a completely ordinary run: the
-        // ffmpeg CLI explicitly sets "auto" (fftools/ffmpeg_enc.c) unless
-        // the user passes -threads themselves, and libavcodec's own
-        // AVOption default for thread_count is 1 (options_table.h), not 0
-        // -- neither of those is a real core count. Resolving that 0 used
-        // to be this encoder's actual bug, not just a missing nicety:
-        // ff_thread_init() (libavcodec/pthread.c, validate_thread_parameters)
-        // force-clamps thread_count to exactly 1 for any codec that
-        // declares none of AV_CODEC_CAP_FRAME_THREADS, _SLICE_THREADS, or
-        // the internal FF_CODEC_CAP_AUTO_THREADS -- confirmed directly
-        // against that function's current source. We deliberately don't
-        // want the first two (see the capabilities comment below), so
-        // without the third this encoder silently got exactly one worker
-        // thread on every run regardless of how many cores were actually
-        // available -- and, because the clamp fires unconditionally in
-        // that branch, regardless of an explicit -threads N too.
-        // FF_CODEC_CAP_AUTO_THREADS (below) stops that clamp, but it also
-        // hands *us* the job that ff_frame_thread_init would otherwise
-        // have done for a generically-threaded codec: turning thread_count
-        // == 0 into a real number.
-        //
-        // Deliberately NOT mirroring ff_frame_thread_init's own "+1" here,
-        // on reflection -- that extra thread earns its keep for a decode
-        // pipeline with real I/O- and sync-adjacent stalls to fill; there's
-        // no equivalent idle time to fill in a pool that does nothing but
-        // call WebPEncode back to back. VP8L's compression search is
-        // compute- *and* cache-heavy (large backward-reference hash
-        // tables, real memory-bandwidth pressure), so on a CPU whose
-        // logical thread count outruns its physical core count and shared
-        // cache size -- a 4C/8T part, say -- one worker beyond nb_cpus
-        // buys nothing and can cost real throughput once the concurrent
-        // working set stops fitting the cache: more reported CPU usage
-        // from cores churning on contention, less actual progress. Plain
-        // nb_cpus, still capped at MAX_AUTO_THREADS, is the more
-        // defensible default; -threads remains how to tune it further for
-        // a specific machine and content, in either direction -- fewer
-        // threads can genuinely outrun more once the cache is the limit,
-        // not the core count.
+        // Thread count. The ffmpeg CLI sets thread_count to 0 ("auto") unless
+        // -threads is given, and for a codec with FF_CODEC_CAP_AUTO_THREADS
+        // libavcodec leaves that 0 alone (see the capability comment on
+        // ff_miku_encoder), so it is resolved here. Auto means one worker per
+        // logical CPU, capped at MAX_AUTO_THREADS. It does not add the extra
+        // thread that generic frame threading adds: these workers do nothing
+        // but WebPEncode, which is compute- and cache-heavy, so a thread
+        // beyond the CPU count buys nothing and can lose throughput to cache
+        // contention. -threads remains the way to tune the count for a given
+        // machine and content, in either direction.
         if (avctx->thread_count > 0) {
             s->nthreads = avctx->thread_count;
         } else {
@@ -683,9 +596,8 @@ static void miku_auto_apply(MikuEncContext *s)
 // complement in bytes. Returns 1 to encode as a delta.
 static int miku_auto_wants_delta(MikuEncContext *s, double zero_frac, int64_t nonzero)
 {
-    // Warm-up: until both a keyframe and a delta have actually been
-    // encoded and fed back (i.e. for roughly the first `lag` frames),
-    // fall back to the old fixed-threshold rule.
+    // Warm-up: until both a keyframe and a delta packet have been fed back
+    // (roughly the first `lag` frames) use the fixed -delta_threshold rule.
     if (!s->have_k || !s->have_d)
         return zero_frac >= s->delta_threshold;
 
@@ -790,7 +702,7 @@ static void miku_lt_insert(MikuEncContext *s, const uint8_t *pixels, int64_t nee
 }
 
 // out = a - b (mod 256) over `needed` bytes; returns how many result bytes are
-// zero. The same loop the previous-frame diff has always used.
+// zero.
 static int64_t miku_diff(uint8_t *out, const uint8_t *a, const uint8_t *b, int64_t needed)
 {
     int64_t zero = 0;
@@ -801,15 +713,14 @@ static int64_t miku_diff(uint8_t *out, const uint8_t *a, const uint8_t *b, int64
     return zero;
 }
 
-// Runs the sequential producer step (delta computation, adaptive heuristic,
-// block-cap, reference update) for the current frame and fills task slot
-// `s->task_index` with whichever buffer (raw or delta) the heuristic
-// chose. Everything here touches only single-threaded, main-thread-only
-// state -- see MikuEncContext's own comment on why none of it needs
-// locking. Does not dispatch (does not touch task_fifo_mutex/task_index
-// itself) -- the caller does that once this returns, matching
-// frame_thread_encoder.c's own split between filling a slot and
-// publishing it.
+// The sequential producer step for the current frame: the residual against
+// the previous frame, the search for a long-term reference, the delta-or-
+// keyframe decision, the chain cap, and the update of ref_frame and the
+// pool. It fills task slot s->task_index with the buffer to compress (a raw
+// frame or a residual). Everything it touches is main-thread-only state (see
+// MikuEncContext), so it takes no locks. It does not dispatch: the caller
+// publishes the slot under task_fifo_mutex once this returns, the same split
+// between filling a slot and publishing it as in frame_thread_encoder.c.
 //
 // Each frame ends up as exactly one of:
 //   keyframe            standalone image (also seeds the long-term pool)
@@ -830,9 +741,8 @@ static int miku_prepare_task(AVCodecContext *avctx, const AVFrame *frame)
     av_image_copy_plane(s->scratch, stride, frame->data[0], frame->linesize[0],
                          stride, avctx->height);
 
-    // Must run exactly once per frame, unconditionally: records are keyed
-    // by frame number, so a skipped call would silently drop that frame's
-    // stats rather than deferring them.
+    // Called once for every frame: records are keyed by frame number, so a
+    // skipped call would drop that frame's stats instead of deferring them.
     if (s->delta_frames && s->delta_auto)
         miku_auto_apply(s);
     task->nonzero      = 0;
@@ -1019,19 +929,19 @@ static int miku_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     pkt->duration = outtask->duration;
 
     if (outtask->is_keyframe) {
-        // Either delta_frames is off (every frame independent, unchanged
-        // from before delta mode existed) or this frame started a fresh
-        // block -- either way it's a standalone, independently decodable
-        // image.
+        // A standalone image: any frame with -delta_frames 0, or the first
+        // frame of a delta chain.
         pkt->flags |= AV_PKT_FLAG_KEY;
     } else {
-        // Delta-chain frame. NOT signaled via AV_PKT_FLAG_KEY: verified
-        // that AV_CODEC_ID_WEBP's codec descriptor is AV_CODEC_PROP_INTRA_ONLY,
-        // which makes libavcodec/encode.c's generic pipeline force that flag
-        // onto every packet this encoder produces regardless of what's set
-        // here. See AV_PKT_DATA_MIKU_IS_DELTA's comment in packet.h.
-        // Payload: 1 byte (0) = delta against the previous frame; 8 bytes =
-        // little-endian frame number of the long-term reference keyframe.
+        // A delta frame is not flagged AV_PKT_FLAG_KEY. The descriptor of
+        // AV_CODEC_ID_WEBP, the id this encoder is registered with, is
+        // AV_CODEC_PROP_INTRA_ONLY, so encode.c sets that flag on every packet
+        // after this callback returns; that is decided in ff_encode_preinit,
+        // before miku_encode_init changes codec_id. The delta kind is
+        // therefore carried as AV_PKT_DATA_MIKU_IS_DELTA side data (see
+        // packet.h): 1 byte (0) for a delta against the previous frame, or
+        // 8 bytes, the little-endian frame number of the long-term reference
+        // keyframe.
         size_t sd_size = outtask->ref_frame_no >= 0 ? 8 : 1;
         uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_MIKU_IS_DELTA, sd_size);
         if (!sd) {
@@ -1119,34 +1029,31 @@ static av_cold int miku_encode_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(MikuEncContext, x)
 #define VE (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
 static const AVOption miku_options[] = {
-    { "method", "Lossless compression effort level (0=fastest, 9=slowest/best compression). "
-      "Passed as the 'level' argument to libwebp's WebPConfigLosslessPreset, which maps it "
-      "onto libwebp's internal method (0-6) through a non-linear preset table -- levels "
-      "7-9 are the only way to reach the two best (slowest) internal settings, so capping "
-      "this option at 6, as it used to be, silently made the best compression libwebp "
-      "offers unreachable. libwebp's own default recommendation is level 6.",
+    { "method", "Lossless compression effort level, 0 (fastest) to 9 (slowest, smallest). "
+      "It is the 'level' argument of libwebp's WebPConfigLosslessPreset, which selects "
+      "libwebp's internal method (0-6) from a preset table; this encoder then sets "
+      "libwebp's quality to 100 whatever the level. In libwebp 1.3.2 (the version this "
+      "was checked against) levels 0-9 select methods 0, 1, 2, 3, 3, 4, 4, 4, 5, 6, so "
+      "levels that share a method (3 and 4; 5, 6 and 7) give identical output.",
       OFFSET(method), AV_OPT_TYPE_INT, { .i64 = 6 }, 0, 9, VE },
     { "exact", "Preserve exact RGB values under fully transparent alpha, for keyframes. "
-      "Always on regardless of this setting for delta residuals, and for keyframes too "
-      "once -delta_frames is on (the default) -- see miku_worker's own comment for why a "
-      "keyframe that seeds a delta chain needs this the same way the deltas themselves "
-      "do. Only actually controls anything when -delta_frames 0 is set explicitly.",
+      "Delta residuals always do, and so do keyframes whenever -delta_frames is on (the "
+      "default), because deltas are computed against a keyframe's exact pixels. The "
+      "option therefore only changes anything with -delta_frames 0.",
       OFFSET(exact), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "thread_level", "Let libwebp try its own internal threading for one frame's encode "
       "(separate from -threads, which parallelizes across frames)",
       OFFSET(thread_level), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
-    { "delta_frames", "Encode as adaptive delta chains against the previous raw frame "
-      "instead of independent keyframes. On by default: the per-frame heuristic below "
-      "already falls back to a keyframe whenever a delta wouldn't help, and delta_method "
-      "bounds the worst-case cost when it's wrong, so this no longer risks forcing a bad "
-      "encode the way it would have before those existed -- set to 0 to force every frame "
-      "independent regardless of content.",
+    { "delta_frames", "Encode as adaptive delta chains (against the previous frame, or a "
+      "remembered keyframe, see -delta_refs) instead of independent keyframes. A frame is "
+      "only coded as a delta when the per-frame decision (-delta_auto, -delta_threshold) "
+      "expects that to help, and -delta_method bounds the encode time of a delta that "
+      "turns out to be hard. 0 codes every frame as an independent keyframe.",
       OFFSET(delta_frames), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
-    { "delta_threshold", "Fraction of unchanged bytes (0..1) above which a candidate "
-      "frame is encoded as a delta rather than ending the block early. With "
-      "-delta_auto 1 (default) this is only the warm-up rule used for the first "
-      "~24 frames, before the tuner has real size feedback; with -delta_auto 0 it "
-      "is the permanent rule",
+    { "delta_threshold", "Fraction of unchanged bytes (0..1) at or above which a frame is "
+      "coded as a delta instead of a keyframe. With -delta_auto 1 (default) this is only "
+      "the warm-up rule for roughly the first 24 frames, before the tuner has size "
+      "feedback; with -delta_auto 0 it is the permanent rule",
       OFFSET(delta_threshold), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0.0, 1.0, VE },
     { "delta_auto", "Choose delta vs keyframe per frame from a cost model learned "
       "from this stream's own compressed packet sizes (no extra encodes, "
@@ -1170,11 +1077,11 @@ static const AVOption miku_options[] = {
       "references; the pool holds at most min(-delta_refs, this budget / frame size) "
       "keyframes. Memory is only committed as keyframes are actually remembered",
       OFFSET(lt_mem_mb), AV_OPT_TYPE_INT, { .i64 = 256 }, 1, 16384, VE },
-    { "delta_method", "Compression method (effort level) used for delta-residual frames "
-      "only; keyframes always use -method. Lower than -method by default: bounds a "
-      "delta candidate's worst-case encode time when delta_threshold's whole-frame "
-      "statistic misjudges it, rather than letting one hard frame cost as much search "
-      "time as a full keyframe -- see the reply",
+    { "delta_method", "Upper limit on libwebp's method (0-6) for delta-residual frames; "
+      "keyframes use the method that -method selects, and a delta frame uses the lower "
+      "of the two. The default is below what the default -method selects, which bounds "
+      "the encode time of a delta the whole-frame decision misjudged: one hard frame "
+      "cannot cost as much search time as a full keyframe.",
       OFFSET(delta_method), AV_OPT_TYPE_INT, { .i64 = 2 }, 0, 6, VE },
     { NULL },
 };
@@ -1193,53 +1100,30 @@ const FFCodec ff_miku_encoder = {
     .p.id           = AV_CODEC_ID_WEBP,
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
                       AV_CODEC_CAP_OTHER_THREADS,
-    // AV_CODEC_CAP_DELAY: required now that this encoder genuinely buffers
-    // output across the worker pool (a frame submitted now may not have its
-    // packet retrievable until a later call, by design -- see the
-    // backpressure formula in miku_encode_frame). Confirmed directly
-    // against codec.h's own doc comment: without this flag, "the codec is
-    // guaranteed to never be fed with NULL data" at all -- the generic
-    // pipeline simply never calls encode() with frame=NULL, so this
-    // encoder's flush-draining logic would never run and any still
-    // in-flight tasks would be silently abandoned when close() runs.
-    // Declaring it also means this encoder is now responsible for setting
-    // pkt->pts *and* pkt->duration itself on every packet (previously
-    // derived automatically by the framework from the input frame) -- see
-    // MikuTask.duration and its use in miku_encode_frame's retrieval logic.
+    // AV_CODEC_CAP_DELAY: a packet is returned some calls after its frame was
+    // submitted (the worker pool, see miku_encode_frame), and the generic code
+    // only sends the NULL drain frame to an encoder that declares this. A
+    // delayed encoder also has to set pts and duration itself, because
+    // encode.c fills them in from the input frame only for encoders without
+    // it; miku_encode_frame does, from MikuTask.
     //
-    // AV_CODEC_CAP_FRAME_THREADS deliberately not declared, in either mode
-    // -- this encoder now always manages its own worker-thread pool
-    // internally (see this file's header comment), which fills the same
-    // role for delta_frames=0 that the generic framework used to, and is
-    // the only safe option for delta_frames=1. Declaring the generic
-    // capability on top of this encoder's own internal threading would
-    // mean the framework tries to round-robin frames across independent
-    // *whole encoder instances* (each with its own worker pool) at the
-    // same time this encoder is already parallelizing internally --
-    // needless oversubscription at best, and for delta_frames=1 the exact
-    // round-robin hazard already established as unsafe.
+    // AV_CODEC_CAP_FRAME_THREADS is not declared: it would run independent
+    // encoder instances, each with its own worker pool, on alternate frames,
+    // and a delta chain needs the previous frame's pixels (see the header
+    // comment).
     //
-    // AV_CODEC_CAP_OTHER_THREADS above, by contrast, is exactly what we
-    // do want: the public "this codec threads itself, through neither
-    // generic mechanism" declaration -- the same one every external-
-    // library-wrapping encoder in this tree pairs with
-    // FF_CODEC_CAP_AUTO_THREADS below (libx264.c, libx265.c, libvpxenc.c,
-    // libaomenc.c, librav1e.c, libsvtav1.c, ...; verified against a real
-    // checkout, not assumed). On its own it doesn't change
-    // ff_thread_init()'s behavior, though -- see .caps_internal.
+    // AV_CODEC_CAP_OTHER_THREADS declares that the codec does its own
+    // threading, as the libx264/libvpx/... wrappers do. `ffmpeg -encoders`
+    // lists it as "threads", and FFmpeg's own consistency test
+    // (libavcodec/tests/avcodec.c) requires one of the three threading
+    // capabilities from any codec that sets FF_CODEC_CAP_AUTO_THREADS.
+    //
+    // FF_CODEC_CAP_AUTO_THREADS: without it, validate_thread_parameters()
+    // (libavcodec/pthread.c) clamps thread_count to 1 for a codec that has
+    // neither frame nor slice threading, so -threads would have no effect. With
+    // it thread_count is left alone, including the 0 ("auto") the ffmpeg CLI
+    // sets unless -threads is given; miku_encode_init resolves that 0 itself.
     .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
-    // The flag that actually matters for thread_count. validate_thread_
-    // parameters() (libavcodec/pthread.c) force-clamps thread_count to 1
-    // for any codec lacking AV_CODEC_CAP_FRAME_THREADS, _SLICE_THREADS,
-    // *and* this internal flag -- confirmed directly against that
-    // function's source. Without it, this encoder always got exactly one
-    // worker thread, on every run, regardless of -threads or core count:
-    // the actual cause of a real, reported "encoder only ever uses one
-    // core" bug. Declaring it tells the generic pipeline this codec -- not
-    // it -- is responsible for interpreting thread_count == 0 ("auto"),
-    // which is why miku_encode_init now resolves that 0 itself (see its
-    // own comment) rather than leaving it to a generic frame/slice-thread
-    // init that never runs for a codec declaring neither.
     CODEC_PIXFMTS(AV_PIX_FMT_BGRA),
     .p.priv_class   = &miku_encoder_class,
     .p.wrapper_name = "miku",

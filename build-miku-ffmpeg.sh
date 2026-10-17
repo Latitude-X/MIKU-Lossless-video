@@ -406,13 +406,17 @@ Re-run with --clean to start from a fresh checkout."
     block="$(mktemp)"
     cat > "$block" <<'BLOCK_EOF'
 
-    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder. Attached to a delta
-    // packet whose reference is a long-term keyframe rather than the
-    // previous frame. Payload: little-endian int64 frame number of that
-    // keyframe, followed by the keyframe's own complete WebP bytes. Makes
-    // the packet self-contained, so the referenced keyframe may be anywhere
-    // in the file, before or after the frame using it. See mikudec.c and
-    // mikudeltadec.c.
+    // AV_PKT_DATA_MIKU_REF_FRAME: demuxer -> decoder (and, for a stream
+    // copy, demuxer -> muxer). Attached to a delta packet whose reference is
+    // a long-term keyframe rather than the previous frame. Payload:
+    // little-endian int64 frame number of that keyframe in the SOURCE file,
+    // followed by the keyframe's own complete WebP bytes. This makes the
+    // packet self-contained, so the referenced keyframe may be anywhere in
+    // the file, before or after the frame using it. The number is only a
+    // hint: the decoder caches decoded references by the keyframe's bytes,
+    // and the muxer matches a stream-copied reference to the keyframe in its
+    // output by content, because source numbering means nothing once frames
+    // are dropped or reordered. See mikudec.c, mikudeltadec.c and mikumux.c.
     AV_PKT_DATA_MIKU_REF_FRAME,
 BLOCK_EOF
     awk -v blockfile="$block" '

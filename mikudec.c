@@ -1,25 +1,28 @@
-// mikudec.c — MIKU Lossless Video demuxer for FFmpeg
+// mikudec.c — .miku demuxer
 //
-// Container: magic "MIKU", 64-byte header, per-frame index table (16 bytes/entry:
-// offset u64, size u32, duration u32), one trailing index entry for the audio blob,
-// video payload = lossless WebP frames, audio payload = a complete embedded FLAC
-// stream. Codec flag 0x01 (WebP), 0x02 (WebP-delta, opt-in) or 0x03 (WebP-delta
-// with long-term references, see below) are the only accepted values (0x00, PNG,
-// was supported pre-v1 and has been removed -- see miku_read_header).
-// In delta mode only, each video index entry's size field has its MSB stolen as a
-// keyframe flag; see miku_get_index_entry and MIKU_CODEC_WEBP_DELTA in mikumux.c for
-// the full picture. Off by default -- non-delta files are read exactly as before.
+// Container: magic "MIKU", 64-byte header, META block, the video frames, one
+// FLAC audio blob and a per-frame index table: 16 bytes per entry {offset u64,
+// size u32, duration u32}, followed by one trailing entry for the audio blob.
+// A video frame's payload is a lossless WebP image; the audio blob is a
+// complete embedded FLAC stream. mikumux.c documents the full layout and the
+// header field offsets.
+//
+// The codec flag selects the video coding and the index shape: 0x01 (WebP),
+// 0x02 (WebP delta) or 0x03 (WebP delta with long-term references, below);
+// no other value is accepted. In delta files (0x02, 0x03) the MSB of each
+// video entry's size field is a keyframe flag, see miku_get_index_entry. In
+// plain WebP files every frame is a keyframe.
 //
 // Format v3 (codec flag 0x03) adds LONG-TERM REFERENCES: a delta frame may
 // reconstruct against any keyframe in the file instead of the previous frame,
-// and the index entries widen to 24 bytes {offset u64, size u32, duration
-// u32, ref i32, reserved u32} to say which. Because a keyframe is a
-// standalone image, the referenced keyframe can sit anywhere -- before or
-// after the frame that uses it -- so for such a frame this demuxer hands the
-// decoder a self-contained packet: the frame's residual as the payload, plus
-// the referenced keyframe's bytes as AV_PKT_DATA_MIKU_REF_FRAME side data.
-// The decoder needs nothing else, which is also what makes seeking safe: a
-// frame with a reference is a chain root, exactly like a keyframe.
+// and the index entries widen to 24 bytes {offset u64, size u32, duration u32,
+// ref i32, reserved u32} to say which. Because a keyframe is a standalone
+// image, the referenced keyframe can sit anywhere, before or after the frame
+// that uses it, so for such a frame this demuxer hands the decoder a
+// self-contained packet: the frame's residual as the payload, plus the
+// referenced keyframe's bytes as AV_PKT_DATA_MIKU_REF_FRAME side data. The
+// decoder needs nothing else, which also makes seeking safe: a frame with a
+// reference is a chain root, like a keyframe.
 
 #include "avformat.h"
 #include "demux.h"
@@ -51,14 +54,15 @@
 #define MIKU_CODEC_WEBP_DELTA_REFS 0x03 // delta mode + 24-byte entries carrying a
                                          // long-term reference per frame (format v3)
 
-// Above this many frames, don't preload the whole index into RAM (item 7).
-// 1,000,000 frames in memory is ~16MB (3 arrays x 4-8 bytes); comfortably
-// safe, but a file with tens of millions of frames could still add up, so
-// we fall back to reading index entries from disk on demand past this point.
+// Above this many frames the index is not preloaded into RAM. One million
+// frames cost 16 to 21 MB (per frame: offset 8, size 4, duration 4 bytes, plus
+// one keyframe byte in delta files and a 4-byte reference in v3), which is
+// comfortably safe, but a file with tens of millions of frames could add up,
+// so past this point index entries are read from disk on demand.
 #define MIKU_INDEX_PRELOAD_MAX 1000000
 
-// Minimum audio read size (item 6). Also used as the interleaving grain --
-// see miku_read_packet().
+// Size of one audio read (the last read of the blob may be shorter); also the
+// interleaving grain, see miku_read_packet().
 #define MIKU_AUDIO_CHUNK_SIZE  65536
 
 typedef struct MikuContext {
@@ -75,20 +79,17 @@ typedef struct MikuContext {
     int      entry_size;         // index stride: 16 (v1/v2) or 24 (v3)
     int      num_frames;
     int      current_frame;
-    int64_t  next_pts;           // item 2 (VFR) fix: running sum of real per-frame
-                                  // durations. Frame i's pts is the sum of frames
-                                  // [0, i)'s durations, NOT i itself -- durations
-                                  // vary for real (this format is AVFMT_VARIABLE_FPS
-                                  // and mikumux.c's own header comment says true
-                                  // per-frame timing lives in this field), so a
-                                  // demuxer that assumes 1 tick = 1 frame silently
-                                  // mistimes every frame after the first one whose
-                                  // duration isn't exactly 1. See
-                                  // miku_read_video_packet and miku_frame_for_pts.
+    int64_t  next_pts;           // pts of the next video packet: the running sum of the
+                                  // real per-frame durations. Frame i's pts is the sum
+                                  // of the durations of frames [0, i), not i itself:
+                                  // durations vary (the format is VFR), so one tick per
+                                  // frame would mistime every frame after the first
+                                  // whose duration is not 1. See miku_read_video_packet
+                                  // and miku_frame_for_pts.
 
-    int      delta_mode;         // 1 iff header codec_flag == MIKU_CODEC_WEBP_DELTA;
-                                  // gates keyframe-bit extraction from the index. When 0,
-                                  // every frame is implicitly a keyframe, exactly as today.
+    int      delta_mode;         // 1 iff codec_flag is 0x02 or 0x03 (delta video); gates
+                                  // keyframe-bit extraction from the index. When 0, every
+                                  // frame is implicitly a keyframe.
     int      index_in_memory;    // 1 = arrays above are valid; 0 = streaming mode
     int64_t  index_table_offset; // file offset of the index table (streaming mode)
 
@@ -102,10 +103,10 @@ typedef struct MikuContext {
     int video_frames_since_audio;
 
     // ---- Shared I/O position cache ----
-    // Tracks where we believe the underlying file descriptor currently sits,
-    // so miku_read_video_packet/miku_read_audio_packet can skip a redundant
-    // avio_seek() when the previous read already left it in the right place
-    // (item 5). -1 means "unknown, must seek before the next read."
+    // Where the file position is believed to be, so that
+    // miku_read_video_packet/miku_read_audio_packet can skip a redundant
+    // avio_seek() when the previous read left it in the right place. -1 means
+    // "unknown, must seek before the next read."
     int64_t file_pos;
 
     // ---- Container header fields ----
@@ -122,12 +123,11 @@ static int miku_probe(const AVProbeData *p)
     return 0;
 }
 
-// Parses the embedded FLAC file's own "fLaC" magic + metadata block chain
-// (starting at audio_offset) to locate the real STREAMINFO block and the
-// byte offset where actual FLAC *frame* data begins. STREAMINFO is copied
-// verbatim into codecpar->extradata -- this mirrors exactly what FFmpeg's
-// own libavformat/flacdec.c does for its extradata, down to the 34-byte
-// FLAC_STREAMINFO_SIZE (verified against current FFmpeg source).
+// Parses the embedded FLAC stream's own "fLaC" magic and metadata block chain
+// (starting at audio_offset) to find the STREAMINFO block and the byte offset
+// where the FLAC *frame* data begins. STREAMINFO is copied verbatim into
+// codecpar->extradata, as libavformat/flacdec.c does: FLAC_STREAMINFO_SIZE
+// (34) bytes.
 static int miku_parse_flac_header(MikuContext *m, AVIOContext *pb,
                                    AVStream *ast, int64_t audio_offset,
                                    int64_t audio_blob_end)
@@ -354,12 +354,11 @@ static int miku_json_parse_dict(const char **p, AVDictionary **dict)
 }
 
 // Parses the top-level object miku_build_metadata_json writes: flat
-// format-metadata keys verbatim (unchanged from the original item 7
-// behavior), plus __miku_streams (video/audio metadata) and
-// __miku_chapters if present. Malformed or unrecognized-shape JSON just
-// abandons the rest of the parse rather than failing the read -- metadata
-// is never load-bearing for whether the file plays, so a corrupt or
-// foreign-written META block should cost you tags/chapters, not the video.
+// format-metadata keys verbatim, plus __miku_streams (video/audio metadata)
+// and __miku_chapters when present. Malformed or unrecognized JSON just
+// abandons the rest of the parse instead of failing the read: metadata is
+// never load-bearing for whether the file plays, so a corrupt or foreign META
+// block should cost the tags and chapters, not the video.
 static void miku_parse_metadata_json(AVFormatContext *s, AVStream *vst, AVStream *ast,
                                       const uint8_t *json, int json_len)
 {
@@ -514,11 +513,10 @@ done:
 }
 
 
-// color/HDR metadata onto vst->codecpar (bug-report follow-up: WebP's
-// bitstream has no field for this, so it's captured/restored at the
-// container level instead, mirroring how libavformat/movenc.c and mov.c
-// handle mdcv/clli). Only the color sub-block is actually parsed here; the
-// JSON metadata and any thumbnail are handled by the separate
+// Restores the colour/HDR metadata onto vst->codecpar. WebP's bitstream has no
+// field for it, so the muxer stores it at the container level, and this
+// mirrors how libavformat/movenc.c and mov.c handle mdcv/clli. Only the color
+// sub-block is parsed here; the JSON metadata and any thumbnail are handled by
 // miku_read_metadata_block below, once both streams exist.
 static int miku_parse_meta_block(AVFormatContext *s, AVStream *vst, int64_t metadata_offset)
 {
@@ -691,10 +689,8 @@ static int miku_read_header(AVFormatContext *s)
     if (!vst) return AVERROR(ENOMEM);
     vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
 
-    // WebP (v1) or WebP-delta (opt-in delta mode) are the only accepted
-    // values. Earlier format versions also supported PNG (codec flag 0x00);
-    // that path produced scrambled video when a file's actual codec didn't
-    // match the hardcoded decoder, and has been removed rather than fixed.
+    // Only WebP (0x01), WebP delta (0x02) and WebP delta with long-term
+    // references (0x03) are accepted; there is no codec flag 0x00 (PNG).
     if (codec_flag != MIKU_CODEC_WEBP && codec_flag != MIKU_CODEC_WEBP_DELTA &&
         codec_flag != MIKU_CODEC_WEBP_DELTA_REFS) {
         av_log(s, AV_LOG_ERROR,
@@ -733,7 +729,7 @@ static int miku_read_header(AVFormatContext *s)
     vst->duration  = m->num_frames;
     vst->nb_frames = m->num_frames;
 
-    // ---- Index table (item 4 groundwork + item 7 streaming fallback) ----
+    // ---- Index table: preloaded up to MIKU_INDEX_PRELOAD_MAX frames, else read on demand ----
     if (m->num_frames <= MIKU_INDEX_PRELOAD_MAX) {
         m->index_in_memory = 1;
         m->frame_offsets   = av_calloc(m->num_frames, sizeof(int64_t));
@@ -811,18 +807,14 @@ static int miku_read_header(AVFormatContext *s)
     ast->codecpar->bits_per_coded_sample = m->bits_per_sample;
     avpriv_set_pts_info(ast, 64, 1, m->sample_rate);
 
-    // BUG FIX #3 (audio): FLAC is compressed and frame-based, unlike raw PCM.
-    // Slicing it at arbitrary byte boundaries (the old fixed 4096-byte chunks
-    // / WAV "+44" skip) does not yield decodable frames -- it only ever
-    // "worked" for PCM because PCM has no internal framing to break.
-    // Fix has two parts:
-    //   1. Parse past "fLaC" + metadata blocks to find real frame data and
-    //      copy STREAMINFO into extradata (miku_parse_flac_header, mirrors
-    //      libavformat/flacdec.c).
-    //   2. Mark the stream AVSTREAM_PARSE_FULL_RAW so libavformat's own FLAC
-    //      parser re-splits whatever byte chunks we hand it into correctly
-    //      bounded, correctly timestamped frames -- verified against current
-    //      FFmpeg source (libavformat/flacdec.c uses the identical pattern).
+    // FLAC is compressed and frame-based, so the blob cannot be cut at
+    // arbitrary byte boundaries into decodable packets. Instead:
+    //   1. Parse past "fLaC" and the metadata blocks to find where the frame
+    //      data starts, and copy STREAMINFO into extradata
+    //      (miku_parse_flac_header; mirrors libavformat/flacdec.c).
+    //   2. Mark the stream AVSTREAM_PARSE_FULL_RAW so libavformat's FLAC
+    //      parser re-splits whatever byte chunks it is handed into correctly
+    //      bounded and timestamped frames (flacdec.c does the same).
     ret = miku_parse_flac_header(m, pb, ast, audio_offset, audio_offset + (int64_t)audio_size);
     if (ret < 0) return ret;
     m->audio_frame_end = audio_offset + audio_size;
@@ -835,12 +827,11 @@ static int miku_read_header(AVFormatContext *s)
                               AV_RL64(header + MIKU_OFF_VIDEO_OFF));
 
     // ---- Interleaving plan ----
-    // The old code served every video packet before any audio packet, which
-    // works but risks starving ffplay's audio queue on a large file (it will
-    // fill its bounded video-packet queue and stall long before demuxing
-    // reaches the first audio byte). Instead we spread MIKU_AUDIO_CHUNK_SIZE
-    // audio reads evenly across the video frame sequence -- see
-    // miku_read_packet().
+    // Serving every video packet before any audio packet would starve a
+    // player's audio queue on a large file: it fills its bounded video queue
+    // and stalls long before demuxing reaches the first audio byte. Instead
+    // MIKU_AUDIO_CHUNK_SIZE-byte audio reads are spread evenly across the
+    // video frame sequence; see miku_read_packet().
     {
         int64_t audio_bytes = m->audio_frame_end - m->audio_frame_start;
         int64_t est_chunks = (audio_bytes + MIKU_AUDIO_CHUNK_SIZE - 1) / MIKU_AUDIO_CHUNK_SIZE;
@@ -859,12 +850,11 @@ static int miku_read_header(AVFormatContext *s)
     return 0;
 }
 
-// Fetches index entry i regardless of whether the table is fully in memory
-// or being streamed from disk on demand (item 7). is_keyframe is always 1
-// when delta_mode is off, matching today's behavior (every frame stands
-// alone). When delta_mode is on, it reflects the MSB stolen from size --
-// masked out here before *size is ever handed to a caller, so the existing
-// "size < 0 is corrupt data" guard downstream never sees a raw stolen bit.
+// Fetches index entry i whether the table is in memory or read from disk on
+// demand. is_keyframe is always 1 when delta_mode is off (every frame stands
+// alone); when it is on, it is the MSB taken from size, which is masked out
+// here so that no caller, and in particular the "size < 0 is corrupt data"
+// check, ever sees the raw flag bit.
 static int miku_get_index_entry(AVFormatContext *s, int i,
                                  int64_t *offset, int32_t *size, int32_t *duration,
                                  int *is_keyframe, int32_t *ref)
@@ -921,7 +911,7 @@ static int miku_read_video_packet(AVFormatContext *s, AVPacket *pkt)
     if (size < 0 || offset < 0)
         return AVERROR_INVALIDDATA; // corrupt index entry; don't hand a bogus size to av_new_packet
 
-    // OPTIMIZATION (item 5): only seek if the fd isn't already sitting here.
+    // Skip the seek if the file position is already here.
     if (m->file_pos != offset)
         avio_seek(pb, offset, SEEK_SET);
 
@@ -935,13 +925,12 @@ static int miku_read_video_packet(AVFormatContext *s, AVPacket *pkt)
 
     pkt->stream_index = 0;
     pkt->duration     = duration > 0 ? duration : 1;
-    pkt->pts          = m->next_pts; // item 2 (VFR): accumulated real duration,
-                                      // not frame index -- see next_pts's own comment
+    pkt->pts          = m->next_pts; // the sum of the real durations so far, not
+                                      // the frame index; see next_pts
     m->next_pts      += pkt->duration;
-    // Non-delta files: every frame is an independent lossless image, exactly
-    // as before. Delta files: reflects the bit the muxer actually wrote for
-    // this frame -- the new stateful decoder (and any generic seek-refinement
-    // logic) needs this to be accurate, not just always-true.
+    // Non-delta files: every frame is an independent image, hence a keyframe.
+    // Delta files: the flag follows the keyframe bit the muxer wrote for this
+    // frame, which the decoder relies on to know where a chain starts.
     if (is_keyframe)
         pkt->flags |= AV_PKT_FLAG_KEY;
 
@@ -949,12 +938,11 @@ static int miku_read_video_packet(AVFormatContext *s, AVPacket *pkt)
 
     // Long-term reference: make the packet self-contained by attaching the
     // referenced keyframe's own bytes. The keyframe may be anywhere in the
-    // file (earlier or later than this frame), so the decoder could never
-    // rely on having already seen it -- and after a seek it genuinely
-    // hasn't. The decoder keeps a small cache keyed by the frame number at
-    // the start of the payload, so for a run of frames sharing one reference
-    // the keyframe is decoded once, not once per frame; re-sending the
-    // compressed bytes costs one extra read from the page cache.
+    // file, before or after this frame, so the decoder cannot count on having
+    // seen it, and after a seek it has not. The decoder keeps a small cache of
+    // decoded references keyed by the keyframe's compressed bytes, so a run of
+    // frames sharing one reference decodes it once; re-sending the compressed
+    // bytes costs one extra read, normally served from the page cache.
     if (ref >= 0) {
         int64_t roff;
         int32_t rsize, rdur, rref;
@@ -1014,14 +1002,15 @@ static int miku_read_audio_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (chunk <= 0) return AVERROR_EOF;
 
-    // OPTIMIZATION (item 5, same cache as video): skip the seek if sequential.
+    // Skip the seek if the previous read left the position here (the same
+    // cache as for video).
     if (m->file_pos != m->audio_cursor)
         avio_seek(pb, m->audio_cursor, SEEK_SET);
 
-    // OPTIMIZATION (item 6): 65536-byte reads instead of 4096. We deliberately
-    // do NOT read the whole FLAC blob into one packet -- see the chat reply
-    // for why that would undo the interleaving above and reintroduce the
-    // queue-starvation problem for large files.
+    // Reads of MIKU_AUDIO_CHUNK_SIZE bytes. The whole FLAC blob is deliberately
+    // not returned as one packet: that would undo the interleaving planned in
+    // miku_read_header and bring back the queue starvation it avoids on large
+    // files.
     ret = av_new_packet(pkt, chunk);
     if (ret < 0) return ret;
     ret = avio_read(pb, pkt->data, pkt->size);
@@ -1059,17 +1048,14 @@ static int miku_read_packet(AVFormatContext *s, AVPacket *pkt)
                        : miku_read_audio_packet(s, pkt);
 }
 
-// item 2 (VFR) fix: finds the largest frame index i whose accumulated pts
-// (sum of frames [0, i)'s durations) is <= target_pts -- i.e. the frame
-// that's actually current at that point in time. Needed because pts is no
-// longer simply the frame index (see next_pts's own comment); works
-// unmodified for both index_in_memory and streaming mode since
-// miku_get_index_entry already abstracts that difference. Cost is O(target
-// frame) index-entry reads -- for index_in_memory that's a fast in-RAM scan
-// (bounded by MIKU_INDEX_PRELOAD_MAX); for streaming mode it's genuinely
-// O(n) disk reads from the start of the file, the honest price of a correct
-// seek when durations aren't uniform and there's no precomputed cumulative
-// table to binary-search instead.
+// Finds the largest frame index i whose accumulated pts (the sum of the
+// durations of frames [0, i)) is <= target_pts, i.e. the frame that is current
+// at that time. pts is not simply the frame index (see next_pts), so this
+// scans the index; it works the same in memory and in streaming mode because
+// miku_get_index_entry hides the difference. The cost is O(target frame) entry
+// reads: a fast in-RAM scan when the index is in memory (bounded by
+// MIKU_INDEX_PRELOAD_MAX), but O(n) disk reads from the start of the file in
+// streaming mode, as there is no cumulative table to binary-search.
 static int64_t miku_frame_for_pts(AVFormatContext *s, int64_t target_pts)
 {
     MikuContext *m = s->priv_data;
@@ -1089,12 +1075,11 @@ static int64_t miku_frame_for_pts(AVFormatContext *s, int64_t target_pts)
     return i;
 }
 
-// item 2 (VFR) fix, companion to the above: sum of frames [0, upto_idx)'s
-// durations -- the pts frame upto_idx would receive from the normal
-// sequential accumulation in miku_read_video_packet. miku_read_seek needs
-// this to re-sync next_pts with wherever current_frame actually ends up,
-// including after the delta-mode keyframe snap below, which can land on an
-// earlier frame than the seek target itself resolved to.
+// Sum of the durations of frames [0, upto_idx): the pts that frame upto_idx
+// gets from the sequential accumulation in miku_read_video_packet.
+// miku_read_seek uses it to re-sync next_pts with wherever current_frame ends
+// up, including after the delta-mode keyframe snap, which can land on an
+// earlier frame than the one the seek target resolved to.
 static int64_t miku_cumulative_duration(AVFormatContext *s, int64_t upto_idx)
 {
     MikuContext *m = s->priv_data;
@@ -1110,10 +1095,9 @@ static int64_t miku_cumulative_duration(AVFormatContext *s, int64_t upto_idx)
     return cum;
 }
 
-// BUG FIX #4: frame-accurate seeking via the index table (item 2 fix: no
-// longer O(1) in general -- see miku_frame_for_pts -- since frame_idx and
-// pts stopped being interchangeable the moment duration stopped being
-// uniformly 1).
+// Seeks via the index table. Not O(1) in general (see miku_frame_for_pts):
+// pts is the running sum of the durations, so a frame index and a pts are not
+// interchangeable once durations are non-uniform.
 static int miku_read_seek(AVFormatContext *s, int stream_index,
                            int64_t timestamp, int flags)
 {
@@ -1141,14 +1125,12 @@ static int miku_read_seek(AVFormatContext *s, int stream_index,
     {
         int64_t video_frame_idx = frame_idx;
 
-        // Delta chains only carry real decoder state forward from a
-        // keyframe (see the new decoder) -- decoding must start there, not
-        // mid-chain. Walk back to the nearest keyframe (or long-term-
-        // referencing frame, which is just as self-sufficient) at or before
-        // frame_idx; normal sequential read_packet (and the decoder) catches
-        // up to the originally requested frame from there. Non-delta files
-        // skip this entirely: every frame is already a keyframe, so seeking
-        // stays exact, unchanged from before delta mode existed.
+        // A delta chain can only be decoded from its root, not from the
+        // middle. Walk back to the nearest keyframe, or frame with a
+        // long-term reference (just as self-sufficient), at or before
+        // frame_idx; sequential reading and the decoder then catch up to the
+        // requested frame from there. Non-delta files skip this: every frame
+        // is a keyframe, so seeking is exact.
         if (m->delta_mode) {
             int steps = 0;
             for (;;) {
@@ -1160,36 +1142,34 @@ static int miku_read_seek(AVFormatContext *s, int stream_index,
                 // reference keyframe itself (see miku_read_video_packet), so
                 // nothing before it is needed.
                 if (is_kf || rf >= 0) break;
-                // Bounded at one block's worth of frames (the spec's 100-frame
-                // cap): an unbroken non-keyframe run longer than that is a
-                // corrupt index, not a legitimate chain -- fail cleanly rather
-                // than walking back through the entire file.
+                // Bounded by the format's 100-frame chain limit (see mikuenc.c):
+                // an unbroken run of non-root frames longer than that is a
+                // corrupt index, not a legitimate chain, so fail cleanly
+                // instead of walking back through the whole file.
                 if (video_frame_idx == 0 || ++steps > 100)
                     return AVERROR_INVALIDDATA;
                 video_frame_idx--;
             }
         }
         m->current_frame = video_frame_idx;
-        // item 2 (VFR) fix: next_pts is a running counter (see its own
-        // comment) that miku_read_video_packet only ever advances forward
-        // sequentially -- a seek jumps current_frame directly and must
-        // re-sync next_pts to match, or every packet after this seek
-        // inherits whatever stale value was left over from before it,
-        // regardless of which direction or how far we just jumped.
+        // next_pts is a running counter that miku_read_video_packet only
+        // advances sequentially. A seek jumps current_frame directly, so it
+        // must re-sync next_pts here, or every later packet would inherit a
+        // stale value whichever way, and however far, the seek went.
         m->next_pts = miku_cumulative_duration(s, video_frame_idx);
     }
 
-    // Video seeking snaps to the nearest preceding keyframe above (exact,
-    // i.e. a no-op snap, for non-delta files). Audio (compressed FLAC) can
-    // only jump to an estimated byte offset proportional to playback
-    // position -- the FLAC parser resynchronizes on the next valid frame
-    // sync it finds, so audio recovers within a fraction of a second rather
-    // than being frame-exact. This deliberately keeps using the original,
-    // unsnapped frame_idx: audio has no "decode forward from a keyframe and
-    // catch up" mechanism the way video does, so the pre-snap position stays
-    // closer to what was actually requested. A byte-exact seek would need a
-    // sample-position -> byte-offset table (e.g. a FLAC SEEKTABLE block),
-    // which miku-pack doesn't currently write.
+    // Video seeking snaps back to the nearest preceding keyframe above (a
+    // no-op for non-delta files). Audio can only jump to a byte offset
+    // estimated in proportion to the playback position, so it is not
+    // frame-exact: the FLAC parser resynchronizes on the next valid frame
+    // header it finds, and because the proportion is by bytes rather than time
+    // the landing point can be far from the requested time when the bitrate
+    // varies. The pre-snap frame_idx is used on purpose: audio has no "decode
+    // forward from a keyframe and catch up" mechanism the way video does, so
+    // the pre-snap position stays closer to what was requested. An accurate
+    // seek would need a sample-position -> byte-offset table (a FLAC SEEKTABLE
+    // block), which the muxer does not write today.
     if (m->audio_frame_end > m->audio_frame_start) {
         double fraction = (double)frame_idx / (double)m->num_frames;
         int64_t span = m->audio_frame_end - m->audio_frame_start;
@@ -1220,14 +1200,11 @@ const FFInputFormat ff_miku_demuxer = {
     .p.long_name    = NULL_IF_CONFIG_SMALL("MIKU Lossless Video"),
     .p.extensions   = "miku",
     .p.flags        = AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK,
-    // Confirmed via a real leak (ASan, a header claiming far more frames
-    // than the file actually backs up): without this, read_close() is
-    // never called when read_header() fails partway through -- e.g. after
-    // frame_offsets/frame_sizes/frame_durations/frame_keyframe are already
-    // allocated but the index table read then hits EOF early and returns
-    // an error. read_close() already handles partial initialization safely
-    // (av_freep is a no-op on still-NULL pointers); it just wasn't being
-    // called at all in the failure case without this flag.
+    // Makes libavformat call read_close() when read_header() fails partway
+    // through, e.g. after the index arrays are allocated but the index read
+    // hits EOF; ASan found a leak there with a header that claimed far more
+    // frames than the file holds. read_close() copes with partial
+    // initialization, since av_freep() is a no-op on NULL pointers.
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .priv_data_size = sizeof(MikuContext),
     .read_probe     = miku_probe,
