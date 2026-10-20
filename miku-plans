@@ -1,3 +1,8 @@
 Add multi track flac audio support --wip
 
-add a hash to the file header to check if its corrupt
+make file managers compatible with double click and able to read metadata and tuumbnail.
+
+fix install sh to include ffplay when installing
+
+add more muxer options so that the user can squese stretch change resolution and fps of a video effecting speed or not
+

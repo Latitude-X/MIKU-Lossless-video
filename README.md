@@ -30,9 +30,13 @@ Muxer = mikumux.c
 Demuxer = mikudec.c
 Decoder = mikudeltadec.c
 
+To give you an idea of the preformance of this format i was able to decode 720p at 24fps smoothly on a Intel Core 2 Duo P8400 (with 2GB ram) with room to spare.
+
 Install instructions: 
 
 Open the location of build-miku-ffmpeg.sh in your terminal and run it (sh builld-miku-ffmpeg) Be carefull it did work fine on my linux machines (EndeavorOS)
 and it should work on most distros but it is still a script. 
 
-This project is Vibe-coded using claude (sonnet 4.6 to 5.5 MAX effort with extended thinking) but all ideas and innovations are mine and NOT claudes. Development started around May of 2026.
+This project is Vibe-coded using claude (sonnet 4.6 to 5.5 MAX effort with extended thinking) but all ideas and innovations are mine and NOT claudes. Development started around May of 2026. 
+
+
